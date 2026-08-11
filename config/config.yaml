@@ -1,13 +1,110 @@
 # ============================================================
 #  Data & paths
 # ============================================================
-data_dir: null
-dataset_dir: ""  # path to mle-bench dataset root, e.g. /data/mle-bench
+data_dir: "/mnt/e/Internship/UCSD/Test v2.0.1/Test v2.0.1/public"
+dataset_dir: "/mnt/e/Internship/UCSD/Test v2.0.1/Test v2.0.1/public"  # mle-bench dataset root; unused for custom tasks, but must be a valid path
 desc_file: null
-goal: null
-eval: null
-exp_name: null
-exp_id: ""
+goal: |
+  Build and train a binary classifier that predicts meningitis from encoded
+  electronic health-record data (per-patient ICD-9 diagnosis code counts).
+  CPU-only: use classical machine learning (logistic regression, random forest,
+  extra-trees, HistGradientBoosting, XGBoost/LightGBM in CPU mode, linear SVM).
+  Do NOT use deep learning or any model that requires a GPU.
+
+  ## Data files
+
+  Two files live in ./input/, one per class:
+    - "full_encoded_meningitis.csv"      -> positive cases, CLASSIFIER = 1
+    - "full_encoded_non_meningitis.xls"  -> negative cases, CLASSIFIER = 0
+
+  CRITICAL: despite the ".xls" extension, "full_encoded_non_meningitis.xls" is a
+  plain comma-separated CSV text file, NOT an Excel workbook. Read BOTH files with
+  pandas.read_csv. Calling pandas.read_excel on it raises
+  "ValueError: Excel file format cannot be determined" and fails the whole run.
+
+  Shapes: positive = 214 rows x 983 columns; negative = 46303 rows x 6962 columns.
+
+  ## Schema
+
+  "SUBJECT_ID" is a patient identifier and MUST be dropped from the features.
+  "GENDER" is a binary feature and MUST be kept.
+  "CLASSIFIER" is the target (1 = meningitis, 0 = not meningitis).
+  Every other column is an ICD-9 diagnosis code holding an integer count per
+  patient, forming a wide sparse matrix.
+
+  ## MANDATORY feature selection - prevents label leakage
+
+  The two files DO NOT share the same columns: 960 are common, 23 exist only in
+  the positive file, and 6002 exist only in the negative file. Concatenating them
+  and filling missing values with 0 encodes the label directly into the schema
+  (the positive-only columns include ICD-9 320-322, which ARE the meningitis
+  diagnosis codes) and yields a meaningless near-perfect score.
+
+  Build the feature matrix exactly like this:
+    1. Read only the header row of each file and take the INTERSECTION of the two
+       column sets, which is 960 columns. NEVER use the union.
+    2. From that intersection remove these 8 CNS-infection / meningitis codes,
+       which are direct proxies for the label:
+         "0362", "0479", "0530", "05472", "3239", "3240", "3241", "325"
+    3. Drop "SUBJECT_ID" from the features and hold out "CLASSIFIER" as the target.
+  This leaves exactly 950 features: 949 ICD-9 code columns plus GENDER. Assert that
+  count in code so any mistake fails loudly instead of silently inflating scores.
+
+  ## Memory
+
+  Pass the selected column list to pandas.read_csv via usecols, and read the ICD-9
+  count columns as numpy.int16. Loading all 6962 negative columns at the default
+  int64 needs roughly 2.6 GB and can exhaust memory.
+
+  ## Class imbalance
+
+  214 positives against 46303 negatives, i.e. 0.46% positive. Handle this
+  explicitly via class_weight="balanced", scale_pos_weight, stratified splits
+  and/or resampling. Use a fixed random seed of 42 everywhere for reproducibility.
+eval: |
+  Primary optimization metric: PRAUC (average precision on the positive/meningitis
+  class). Maximize it.
+
+  ## Protocol
+
+  There is no separate hold-out file. First carve out a stratified 20% hold-out
+  test split, then run stratified 5-fold cross-validation on the remaining 80%.
+  Keep the split seed fixed at 42.
+
+  Rank solutions by the mean out-of-fold cross-validated PRAUC on the 80%, NOT by
+  the hold-out test score. The hold-out split must be touched only once, at the
+  end, to report an unbiased final estimate. Using it to guide model selection
+  across search steps would overfit it.
+
+  Report ALL of the following for the positive class, as cross-validated mean and
+  standard deviation AND on the hold-out test split:
+    - AUC (ROC-AUC)
+    - PRAUC (average precision)
+    - Recall / Sensitivity
+    - Specificity
+    - PPV (Precision)
+    - NPV (Negative Predictive Value)
+    - F1 score
+  For the threshold-dependent metrics (recall, specificity, PPV, NPV, F1) report
+  both at the default 0.5 threshold AND at an optimal threshold selected on the
+  training folds only (max F1 or Youden's J); state which threshold was used and
+  how it was chosen. Choosing the threshold on the hold-out split is leakage.
+
+  ## Required outputs
+
+  1. REQUIRED "./submission/submission.csv" with exactly two columns, "SUBJECT_ID"
+     and "CLASSIFIER", where CLASSIFIER is the predicted probability of the
+     positive class for every row of the 20% hold-out test split. The run is
+     marked FAILED if this file is missing, so write it as soon as predictions
+     exist, before producing any plots or reports that could raise.
+  2. REQUIRED print the mean out-of-fold cross-validated PRAUC as the final line,
+     exactly: print(f"Final Validation Score: {cv_prauc_mean}")
+  3. "./working/metrics.csv" plus an equivalent markdown summary table covering
+     every metric listed above.
+  4. PNG plots in "./working/": ROC curve with AUC, precision-recall curve with
+     PRAUC, confusion matrix, and top feature importances or coefficients.
+exp_name: "first_test"
+exp_id: "exp01"
 
 log_dir: ./runs
 log_level: INFO
@@ -17,7 +114,7 @@ copy_data: False
 
 # Resource
 start_cpu_id: 0
-cpu_number: 21
+cpu_number: 11   # this machine reports 12 cores; leave one free
 
 # Model paths
 torch_hub_dir: ""       # path to torch hub cache, e.g. /data/pretrain_models/torch_models
@@ -36,23 +133,30 @@ exec:
 agent:
 
   # --- Basic run params ---
-  steps: 500
-  time_limit: 43200          # 12h
+  steps: 200
+  time_limit: 3600
   initial_drafts: 3
   seed: 42
   data_preview: True
 
   # --- LLM models ---
+  # API keys are read from the environment (see .env.example); never hard-code
+  # them here, this file is git-tracked.
   code:
-    model: gemini-3-pro-preview
+    model: glm-5.2
     temp: 1
-    base_url: ""   # Gemini API endpoint
-    api_key: ""    # Gemini API key
+    base_url: "https://open.bigmodel.cn/api/paas/v4"   # GLM API endpoint
+    api_key: ${oc.env:MLEVOLVE_CODE_API_KEY,""}
+    # Reasoning models spend part of this budget thinking. Too low and the code
+    # block is cut mid-token, the ``` fence never closes, and extraction fails
+    # (then retries 3x at full cost). Raise if you see truncation warnings.
+    max_tokens: 65536
   feedback:
-    model: gemini-3-pro-preview
+    model: glm-4.5-air
     temp: 1
-    base_url: ""   # Gemini API endpoint
-    api_key: ""    # Gemini API key
+    base_url: "https://open.bigmodel.cn/api/paas/v4"   # GLM  API endpoint
+    api_key: ${oc.env:MLEVOLVE_FEEDBACK_API_KEY,""}
+    max_tokens: 16384
 
   # --- Submission check ---
   check_data_leakage: True
@@ -74,7 +178,7 @@ agent:
   # --- Global memory ---
   use_global_memory: True
   memory_similarity_threshold: 0.7
-  memory_embedding_device: cuda
+  memory_embedding_device: cpu
   memory_embedding_model_path: "BAAI/bge-base-en-v1.5"  # HuggingFace model name or local path
 
   # --------------------------------------------------------
@@ -83,16 +187,16 @@ agent:
   search:
     # Parallel & resources
     parallel_search_num: 3
-    num_gpus: 1
+    num_gpus: 0
 
     # Node expansion limits
-    num_drafts: 5
+    num_drafts: 3
     num_bugs: 1
-    num_improves: 3
+    num_improves: 2
     topk_max_improves: 10
 
     # Debug depth
-    max_debug_depth: 20
+    max_debug_depth: 15
     back_debug_depth: 3
     debug_prob: 1
 
@@ -141,6 +245,18 @@ agent:
     lower_bound: 0.5
     alpha: 0.01
     phase_ratios: [0.3, 0.7]
+
+# ============================================================
+#  Plan mode
+# ============================================================
+plan_mode:
+  # The run drafts a plan, shows how clean_task_desc rewrote your goal, and
+  # waits for approval before any search starts.
+  # NOTE: a headless session (cron, nohup, piped stdin) cannot answer the
+  # prompt and will abort rather than run unapproved. Unattended runs must
+  # pass plan_mode.require_confirmation=False — run_single_task.sh already does.
+  require_confirmation: true
+  show_task_diff: true
 
 # ============================================================
 #  Cold-start knowledge

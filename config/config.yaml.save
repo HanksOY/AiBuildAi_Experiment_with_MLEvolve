@@ -1,0 +1,249 @@
+# ============================================================
+#  Data & paths
+# ============================================================
+data_dir: "/mnt/e/Internship/UCSD/Test v2.0.1/Test v2.0.1/public"
+dataset_dir: "/mnt/e/Internship/UCSD/Test v2.0.1/Test v2.0.1/public"  # mle-bench dataset root; unused for custom tasks, but must be a valid path
+desc_file: null
+goal: |
+  Build and train a binary classifier that predicts meningitis from encoded
+  electronic health-record data (per-patient ICD-9 diagnosis code counts).
+  CPU-only: use classical machine learning (logistic regression, random forest,
+  extra-trees, HistGradientBoosting, XGBoost/LightGBM in CPU mode, linear SVM).
+  Do NOT use deep learning or any model that requires a GPU.
+
+  ## Data files
+
+  Two files live in ./input/, one per class:
+    - "full_encoded_meningitis.csv"      -> positive cases, CLASSIFIER = 1
+    - "full_encoded_non_meningitis.xls"  -> negative cases, CLASSIFIER = 0
+
+  CRITICAL: despite the ".xls" extension, "full_encoded_non_meningitis.xls" is a
+  plain comma-separated CSV text file, NOT an Excel workbook. Read BOTH files with
+  pandas.read_csv. Calling pandas.read_excel on it raises
+  "ValueError: Excel file format cannot be determined" and fails the whole run.
+
+  Shapes: positive = 214 rows x 983 columns; negative = 46303 rows x 6962 columns.
+
+  ## Schema
+
+  "SUBJECT_ID" is a patient identifier and MUST be dropped from the features.
+  "GENDER" is a binary feature and MUST be kept.
+  "CLASSIFIER" is the target (1 = meningitis, 0 = not meningitis).
+  Every other column is an ICD-9 diagnosis code holding an integer count per
+  patient, forming a wide sparse matrix.
+
+  ## MANDATORY feature selection - prevents label leakage
+
+  The two files DO NOT share the same columns: 960 are common, 23 exist only in
+  the positive file, and 6002 exist only in the negative file. Concatenating them
+  and filling missing values with 0 encodes the label directly into the schema
+  (the positive-only columns include ICD-9 320-322, which ARE the meningitis
+  diagnosis codes) and yields a meaningless near-perfect score.
+
+  Build the feature matrix exactly like this:
+    1. Read only the header row of each file and take the INTERSECTION of the two
+       column sets, which is 960 columns. NEVER use the union.
+    2. From that intersection remove these 8 CNS-infection / meningitis codes,
+       which are direct proxies for the label:
+         "0362", "0479", "0530", "05472", "3239", "3240", "3241", "325"
+    3. Drop "SUBJECT_ID" from the features and hold out "CLASSIFIER" as the target.
+  This leaves exactly 950 features: 949 ICD-9 code columns plus GENDER. Assert that
+  count in code so any mistake fails loudly instead of silently inflating scores.
+
+  ## Memory
+
+  Pass the selected column list to pandas.read_csv via usecols, and read the ICD-9
+  count columns as numpy.int16. Loading all 6962 negative columns at the default
+  int64 needs roughly 2.6 GB and can exhaust memory.
+
+  ## Class imbalance
+
+  214 positives against 46303 negatives, i.e. 0.46% positive. Handle this
+  explicitly via class_weight="balanced", scale_pos_weight, stratified splits
+  and/or resampling. Use a fixed random seed of 42 everywhere for reproducibility.
+eval: |
+  Primary optimization metric: PRAUC (average precision on the positive/meningitis
+  class). Maximize it.
+
+  ## Protocol
+
+  There is no separate hold-out file. First carve out a stratified 20% hold-out
+  test split, then run stratified 5-fold cross-validation on the remaining 80%.
+  Keep the split seed fixed at 42.
+
+  Rank solutions by the mean out-of-fold cross-validated PRAUC on the 80%, NOT by
+  the hold-out test score. The hold-out split must be touched only once, at the
+  end, to report an unbiased final estimate. Using it to guide model selection
+  across search steps would overfit it.
+
+  Report ALL of the following for the positive class, as cross-validated mean and
+  standard deviation AND on the hold-out test split:
+    - AUC (ROC-AUC)
+    - PRAUC (average precision)
+    - Recall / Sensitivity
+    - Specificity
+    - PPV (Precision)
+    - NPV (Negative Predictive Value)
+    - F1 score
+  For the threshold-dependent metrics (recall, specificity, PPV, NPV, F1) report
+  both at the default 0.5 threshold AND at an optimal threshold selected on the
+  training folds only (max F1 or Youden's J); state which threshold was used and
+  how it was chosen. Choosing the threshold on the hold-out split is leakage.
+
+  ## Required outputs
+
+  1. REQUIRED "./submission/submission.csv" with exactly two columns, "SUBJECT_ID"
+     and "CLASSIFIER", where CLASSIFIER is the predicted probability of the
+     positive class for every row of the 20% hold-out test split. The run is
+     marked FAILED if this file is missing, so write it as soon as predictions
+     exist, before producing any plots or reports that could raise.
+  2. REQUIRED print the mean out-of-fold cross-validated PRAUC as the final line,
+     exactly: print(f"Final Validation Score: {cv_prauc_mean}")
+  3. "./working/metrics.csv" plus an equivalent markdown summary table covering
+     every metric listed above.
+  4. PNG plots in "./working/": ROC curve with AUC, precision-recall curve with
+     PRAUC, confusion matrix, and top feature importances or coefficients.
+exp_name: "first_test"
+exp_id: "exp01"
+
+log_dir: ./runs
+log_level: INFO
+workspace_dir: ./runs
+preprocess_data: True
+copy_data: False
+
+# Resource
+start_cpu_id: 0
+cpu_number: 21
+Cranston
+# Model paths
+torch_hub_dir: ""       # path to torch hub cache, e.g. /data/pretrain_models/torch_models
+pretrain_model_dir: ""  # path to pretrained model weights, e.g. /data/pretrain_models
+
+# ============================================================
+#  Code execution
+# ============================================================
+exec:
+  timeout: 32400
+  agent_file_name: runfile.py
+
+# ============================================================
+#  Agent config
+# ============================================================
+agent:
+
+  # --- Basic run params ---
+  steps: 200
+  time_limit: 3600
+  initial_drafts: 3
+  seed: 42
+  data_preview: True
+
+  # --- LLM models ---
+  code:
+    model: glm-5.2
+    temp: 1
+    base_url: "https://open.bigmodel.cn/api/paas/v4"   # GLM API endpoint
+    api_key: "d11477b59d69495297005dc67a010676.bBlKrzrDCgESLgdR"
+  feedback:
+    model: glm-4.5-air
+    temp: 1
+    base_url: "https://open.bigmodel.cn/api/paas/v4"   # GLM  API endpoint
+    api_key: "d11477b59d69495297005dc67a010676.bBlKrzrDCgESLgdR"    # GLM API key
+
+  # --- Submission check ---
+  check_data_leakage: True
+
+  # --- Code gen mode ---
+  use_diff_mode: True                 # Multi-Mode Codegen
+  use_stepwise_generation: True       # Multi-Mode Codegen
+
+  # --- Triggered-action master switches (ablation use) ---
+  use_evolution: True                # intra-branch evolution on stagnation
+  use_fusion: True                   # cross-branch fusion on stagnation (>=6h)
+  use_aggregation: True              # multi-branch aggregation at root
+
+  # --- Branch strategy ---
+  fusion_vs_evolution_prob: 0.3
+  branch_fusion_trigger_prob: 1.0
+  max_fusion_drafts: 2
+
+  # --- Global memory ---
+  use_global_memory: True
+  memory_similarity_threshold: 0.7
+  memory_embedding_device: cpu
+  memory_embedding_model_path: "BAAI/bge-base-en-v1.5"  # HuggingFace model name or local path
+
+  # --------------------------------------------------------
+  #  Search tree params
+  # --------------------------------------------------------
+  search:
+    # Parallel & resources
+    parallel_search_num: 3
+    num_gpus: 0
+
+    # Node expansion limits
+    num_drafts: 3
+    num_bugs: 1
+    num_improves: 2
+    topk_max_improves: 10
+
+    # Debug depth
+    max_debug_depth: 15
+    back_debug_depth: 3
+    debug_prob: 1
+
+    # Improvement criteria
+    metric_improvement_threshold: 0.0001
+    max_improve_failure: 3
+
+    # Stagnation detection
+    branch_stagnation_threshold: 3
+    topk_stagnation_threshold: 6
+    stagnation_window: 4
+    top_candidates_size: 20
+
+    # Explore-exploit soft switch
+    explore_switch_start: 0.5
+    explore_switch_end: 0.7
+    min_exploration_weight: 0.2       # Top-K enabled
+
+    # Top-K node selection
+    topk_early_k: 5
+    topk_early_max_per_branch: 3
+    topk_late_k: 3
+    topk_late_max_per_branch: 2
+
+    # Force backprop
+    force_backprop_late_threshold: 0.80
+    force_backprop_late_prob: 0.5
+    force_backprop_mid_threshold: 0.4
+    force_backprop_mid_modulo: 3
+    recent_best_window: 4
+
+    # Multi-branch fusion conditions
+    fusion_min_time_hours: 6
+    fusion_max_time_hours: 10
+    fusion_min_successful_nodes: 2
+    fusion_min_branches: 2
+
+    # Stagnation detection master switch (ablation: set False for vanilla MCTS baseline)
+    use_stagnation_detection: True
+
+  # --------------------------------------------------------
+  #  Exploration constant decay
+  # --------------------------------------------------------
+  decay:
+    exploration_constant: 1.414
+    lower_bound: 0.5
+    alpha: 0.01
+    phase_ratios: [0.3, 0.7]
+
+# ============================================================
+#  Cold-start knowledge
+# ============================================================
+coldstart:
+  use_coldstart: True                 # Cold-start KB enabled
+  task_json_path: "engine/coldstart/competition_tag_classified.json"
+  model_json_path: "engine/coldstart/models_guidance_classified.json"
+  description: ""

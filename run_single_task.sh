@@ -63,6 +63,9 @@ CLOSEST_EXP_NAME="${TIMESTAMP}_${EXP_ID}"
 
 
 # ── Run the main agent loop ──
+# plan_mode.require_confirmation=False: this is an unattended benchmark run with
+# no terminal to answer the plan prompt. Delete that line if you want this script
+# to stop and ask for approval too (it then requires an interactive shell).
 CUDA_VISIBLE_DEVICES=$MEMORY_INDEX timeout --foreground --signal=TERM --kill-after=10s "${TIME_LIMIT_SECS}s" python run.py \
   exp_id="${EXP_ID}" \
   dataset_dir="${dataset_dir}" \
@@ -70,7 +73,8 @@ CUDA_VISIBLE_DEVICES=$MEMORY_INDEX timeout --foreground --signal=TERM --kill-aft
   desc_file="${dataset_dir}/${EXP_ID}/prepared/public/description.md" \
   exp_name="${EXP_ID}" \
   start_cpu_id="${start_cpu}" \
-  cpu_number="${CPUS_PER_TASK}"
+  cpu_number="${CPUS_PER_TASK}" \
+  plan_mode.require_confirmation=False
 
 RUN_EXIT=$?
 

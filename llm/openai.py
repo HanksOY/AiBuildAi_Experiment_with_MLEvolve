@@ -78,13 +78,12 @@ def _stage_config_for_model(cfg: Config, model: str):
 
 
 def _build_messages(system_message: str | None, user_message: str | None, model: str = "") -> list[dict[str, str]]:
-    # Anthropic API (Claude) requires the messages array to contain at least
-    # one user-role message; system is a separate top-level field. When only
-    # system_message is provided, the OpenAI-compat proxy converts
-    # [{role: system}] -> system="...", messages=[] which Anthropic rejects
-    # with "field messages is required". Promote system to user in that case.
-    is_claude = (model or "").lower().startswith("claude")
-    if is_claude and system_message and not user_message:
+    # Several providers reject a messages array that contains only a system
+    # message: Anthropic (Claude) requires at least one user-role message, and
+    # GLM/BigModel returns error 1214 ("messages 参数非法") for system-only
+    # requests. A single user message is universally accepted, so promote the
+    # system content to a user message whenever no user_message is provided.
+    if system_message and not user_message:
         return [{"role": "user", "content": system_message}]
 
     messages = []
@@ -138,7 +137,7 @@ def query(
         "model": model,
         "messages": messages,
         "temperature": profile.get("temperature", filtered.get("temperature", 1.0)),
-        "max_tokens": filtered.get("max_tokens", 16384),
+        "max_tokens": filtered.get("max_tokens", getattr(stage, "max_tokens", None) or 16384),
     }
     if "top_p" in profile:
         params["top_p"] = profile["top_p"]
@@ -235,14 +234,15 @@ def generate(
     json_schema: dict | None = None,
     max_retries: int = 20,
     retry_delay: float = 3,
+    stage: str = "code",
 ) -> str:
     """Streaming text generation via OpenAI-compatible Chat API. Supports chat format {system, user, assistant} for Qwen."""
-    stage = cfg.agent.code
-    model = stage.model
+    stage_cfg = getattr(cfg.agent, stage, None) or cfg.agent.code
+    model = stage_cfg.model
     messages = _prompt_to_messages(prompt, model=model)
     client = OpenAI(
-        api_key=stage.api_key,
-        base_url=stage.base_url or None,
+        api_key=stage_cfg.api_key,
+        base_url=stage_cfg.base_url or None,
         timeout=1200.0,
     )
     # Qwen: thinking + json_schema are mutually exclusive — drop schema, keep thinking.
@@ -263,11 +263,14 @@ def generate(
     if use_thinking:
         extra_body.update(get_thinking_extra_body(model))
 
+    if max_tokens is None:
+        max_tokens = getattr(stage_cfg, "max_tokens", None) or 16384
+
     params: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "temperature": profile.get("temperature", temperature if temperature is not None else 1.0),
-        "max_tokens": max_tokens if max_tokens is not None else 16384,
+        "max_tokens": max_tokens,
         "stream": True,
     }
     if "top_p" in profile:
@@ -292,11 +295,24 @@ def generate(
         try:
             stream = client.chat.completions.create(**params)
             full_text = ""
+            finish_reason = None
             for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
+                if not chunk.choices:
+                    continue
+                if chunk.choices[0].delta.content:
                     full_text += chunk.choices[0].delta.content
+                if chunk.choices[0].finish_reason:
+                    finish_reason = chunk.choices[0].finish_reason
             if "</think>" in full_text:
                 full_text = full_text[full_text.find("</think>") + 8:]
+            # A response cut at the token limit leaves the ``` fence unclosed, so
+            # extract_code() silently returns "" and the caller burns its full
+            # retry budget regenerating the same over-long answer. Say so loudly.
+            if finish_reason == "length":
+                logger.warning(
+                    f"Response truncated by max_tokens ({max_tokens}) for model {model}. "
+                    f"Code extraction will likely fail — raise agent.<stage>.max_tokens in config.yaml."
+                )
             logger.info(f"generate response: {full_text}", extra={"verbose": True})
             return full_text
         except Exception as e:

@@ -81,6 +81,11 @@ def query(
     return output
 
 
+def stage_config(cfg: Config, stage: str = "code"):
+    """Return the cfg.agent.<stage> block, falling back to `code` if absent."""
+    return getattr(cfg.agent, stage, None) or cfg.agent.code
+
+
 def generate(
     prompt,
     cfg,
@@ -90,9 +95,16 @@ def generate(
     json_schema=None,
     max_retries=20,
     retry_delay=3,
+    stage="code",
 ):
-    """Streaming text generation. Dispatches to Gemini or OpenAI-compatible backend by cfg.agent.code.model."""
-    model = getattr(cfg.agent.code, "model", "") or ""
+    """Streaming text generation.
+
+    `stage` selects which cfg.agent.<stage> block supplies the model, base_url
+    and api_key. It defaults to "code" because most callers are code-generation
+    agents; result/validation agents should pass stage="feedback" so they are
+    not silently billed to the code model's credentials.
+    """
+    model = getattr(stage_config(cfg, stage), "model", "") or ""
     if _provider(model) == "openai":
         return _openai.generate(
             prompt=prompt,
@@ -103,6 +115,7 @@ def generate(
             json_schema=json_schema,
             max_retries=max_retries,
             retry_delay=retry_delay,
+            stage=stage,
         )
     return _gemini.generate(
         prompt=prompt,
@@ -113,4 +126,5 @@ def generate(
         json_schema=json_schema,
         max_retries=max_retries,
         retry_delay=retry_delay,
+        stage=stage,
     )

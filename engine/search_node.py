@@ -47,6 +47,9 @@ class SearchNode(DataClassJsonMixin):
     metric: MetricValue = field(default=None, kw_only=True)  # type: ignore
     is_buggy: bool = field(default=None, kw_only=True)  # type: ignore
     is_valid: bool = field(default=None, kw_only=True)  # type: ignore
+    # Scored and wrote a submission, but raised afterwards (e.g. a plotting call).
+    # Not buggy — the metric stands — but the error is carried forward for repair.
+    completed_with_errors: bool = field(default=False, kw_only=True)
 
     # ---- search / MCTS ----
     stage: Literal["root", "improve", "debug", "draft", "fusion_draft", "evolution", "fusion"]

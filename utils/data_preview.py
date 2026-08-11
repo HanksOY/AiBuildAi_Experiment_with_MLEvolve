@@ -251,7 +251,7 @@ logger = logging.getLogger("MLEvolve")
 
 def clean_task_desc(task_desc: str, cfg) -> str:
     """Clean task_desc with LLM (remove env-only noise, keep core task); append sample_submission format if present."""
-    from llm import query
+    from llm import query, compile_prompt_to_md
 
     acfg = cfg.agent
     alignment_rule = (
@@ -303,7 +303,7 @@ def clean_task_desc(task_desc: str, cfg) -> str:
         cleaned_desc = cleaned_desc.strip()
     except Exception as e:
         logger.warning(f"Failed to clean task_desc with LLM: {e}. Using original.")
-        cleaned_desc = task_desc
+        cleaned_desc = task_desc if isinstance(task_desc, str) else compile_prompt_to_md(task_desc)
 
     input_dir = os.path.join(cfg.workspace_dir, "input")
     sample_submission_paths = [

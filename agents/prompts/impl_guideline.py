@@ -62,7 +62,22 @@ def get_impl_guideline(
         "• If the submission predicts structured outputs, your validation metric must cover the key predicted structure rather than only a weak sub-component.",
         "• The validation target, prediction format, and post-processing logic must stay semantically aligned with the required submission format.",
         "",
-        "**5. Make Validation Auditable**",
+        "**5. Fit ALL Preprocessing Inside the Split**",
+        "• EVERY step that learns from data must be fitted on the training portion ONLY, then applied to the held-out portion.",
+        "• This covers: scalers/normalizers, imputers, encoders (target/ordinal/frequency), feature selection, PCA/SVD, resampling (SMOTE etc.), and decision-threshold selection.",
+        "• In cross-validation this means fitting INSIDE each fold, not once before the loop.",
+        "• ❌ FORBIDDEN pattern — this leaks every fold's validation rows into its own transform:",
+        "    scaler.fit(X_train); Xs = scaler.transform(X_train)",
+        "    for tr, va in folds: model.fit(Xs[tr], y[tr]); model.predict(Xs[va])",
+        "• ✅ CORRECT — refit per fold, or wrap in a Pipeline so sklearn does it for you:",
+        "    for tr, va in folds:",
+        "        sc = StandardScaler().fit(X_train[tr])",
+        "        model.fit(sc.transform(X_train[tr]), y[tr]); model.predict(sc.transform(X_train[va]))",
+        "    # or: cross_val_score(make_pipeline(StandardScaler(), model), X, y, cv=folds)",
+        "• Printing 'fitted on training data only' is NOT sufficient — that is true of the hold-out split while still leaking across CV folds. Check the fold loop itself.",
+        "• Why: this silently inflates your CV score, so search ranks a worse solution first and the reported number does not hold up.",
+        "",
+        "**6. Make Validation Auditable**",
         "• In code and logs, make the validation setup easy to audit: split method, metric formula, predicted target, and any threshold/post-processing used.",
         "• The reported `Final Validation Score` must be computed with the official metric definition, or a task-faithful local implementation of that same metric.",
         "• ❌ FORBIDDEN: Using a proxy metric as the main validation score for model comparison, search ranking, or best-solution selection.",
@@ -81,6 +96,13 @@ def get_impl_guideline(
         "• Print only 1 line per epoch (minimize logging)",
         "• Use DataLoader with num_workers>=2 for speed",
         "",
+        "📓 **Section Headers**: Open each logical section with a standalone comment of "
+        "the form `# --- <short section title> ---`. Optionally precede it with a `# %%` "
+        "line for explicit notebook cells. These are ordinary comments and do not change "
+        "how the script runs; they let the finished solution be exported as a readable "
+        "notebook. Typical sections: imports & config, data loading, feature engineering, "
+        "model definition, training/CV, evaluation, submission, plots.",
+        "",
         "⚠️  **Self-Check Before Finalizing**:",
         "□ Did predictions pass through model's learned weights during inference? (If NO → INVALID)",
         "□ Did I generate submission.csv in correct path with ALL test predictions?",
@@ -88,6 +110,7 @@ def get_impl_guideline(
         "□ Did I use the COMPLETE training dataset (not a tiny subset)?",
         "□ Did my local validation preserve the original task semantics instead of a simpler proxy?",
         "□ Is my reported `Final Validation Score` computed with the official metric definition rather than a proxy metric?",
+        "□ Is every scaler/imputer/encoder/selector/resampler fitted INSIDE the fold loop, not once before it?",
     ]
     if expose_prediction:
         impl_guideline.append(

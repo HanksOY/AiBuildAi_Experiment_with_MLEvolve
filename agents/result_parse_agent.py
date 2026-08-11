@@ -196,6 +196,15 @@ def _save_code_summary(agent, node: SearchNode, response: dict):
 
 
 def _determine_buggy(node: SearchNode, response: dict, has_csv_submission: bool):
+    """Decide whether a node failed.
+
+    A submission plus a reported metric means the solution reached the end of its
+    scoring path, so a later exception is a defect in the run, not a failure of
+    it. Discarding those threw away working solutions over cosmetic crashes — a
+    broken plotting call after the submission was already written, for example.
+    Such nodes keep their score and carry the error forward so the debug/improve
+    agents fix it on the next iteration.
+    """
     failure_reasons = []
     if response["is_bug"]:
         failure_reasons.append("execution error detected")
@@ -206,13 +215,45 @@ def _determine_buggy(node: SearchNode, response: dict, has_csv_submission: bool)
     if not has_csv_submission:
         failure_reasons.append("submission file not found")
 
-    node.is_buggy = len(failure_reasons) > 0
+    # Both artifacts present: the metric is only printed at the end of scoring,
+    # and the submission is written from real predictions, so the run got there.
+    produced_results = has_csv_submission and response["metric"] is not None
+    node.completed_with_errors = bool(failure_reasons) and produced_results
+
+    node.is_buggy = bool(failure_reasons) and not produced_results
+
     if node.is_buggy:
         logger.warning(f"Node {node.id} marked as buggy: {'; '.join(failure_reasons)}")
+    elif node.completed_with_errors:
+        detail = "; ".join(failure_reasons)
+        logger.warning(
+            f"Node {node.id} produced a submission and metric={response['metric']} but hit errors "
+            f"({detail}). Keeping the result; flagged for repair."
+        )
+        node.analysis = (
+            f"{node.analysis}\n\n"
+            "NOTE: this solution completed scoring and wrote a valid submission, but the run "
+            f"raised errors afterwards ({detail}). The metric is usable. Fix the error in the "
+            "next revision without changing the modelling approach that produced this score."
+        )
+
+
+def _grading_exp_id(cfg) -> str:
+    """Competition id for the grading server.
+
+    cfg.exp_id holds it directly. cfg.exp_name is prefixed with a
+    "YYYYmmdd_HHMMSS_" timestamp by prep_cfg, so index-slicing it apart drops
+    everything after the first underscore of the name itself (e.g. "first_test"
+    -> "first"). Only fall back to stripping that prefix if exp_id is unset.
+    """
+    exp_id = getattr(cfg, "exp_id", None)
+    if exp_id:
+        return exp_id
+    return cfg.exp_name.split("_", 2)[-1]
 
 
 def _validate_format_with_retry(agent, node: SearchNode):
-    exp_id = agent.cfg.exp_name.split("_")[2]
+    exp_id = _grading_exp_id(agent.cfg)
     submission_path = agent.cfg.workspace_dir / "submission" / f"submission_{node.id}.csv"
 
     status, res = _validate_submission_with_retry(
@@ -249,7 +290,7 @@ def _validate_format_with_retry(agent, node: SearchNode):
 
 
 def _validate_format_simple(agent, node: SearchNode):
-    exp_id = agent.cfg.exp_name.split("_")[2]
+    exp_id = _grading_exp_id(agent.cfg)
     submission_path = agent.cfg.workspace_dir / "submission" / f"submission_{node.id}.csv"
 
     status, res = call_validate(exp_id=exp_id, submission_path=submission_path)

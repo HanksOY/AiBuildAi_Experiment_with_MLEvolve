@@ -75,6 +75,18 @@ _PROFILES: dict[str, dict] = {
         },
     },
 
+    # ── GLM / BigModel series (GLM-4.5, GLM-5.x) ───
+    # Reasoning is on by default server-side and its tokens count against
+    # max_tokens, so codegen needs a generous budget (see StageConfig.max_tokens).
+    "glm": {
+        "thinking": {
+            "temperature": 1.0,
+        },
+        "non_thinking": {
+            "temperature": 0.7,
+        },
+    },
+
     # ── Fallback for any unrecognised model ──────────────────────────────────
     "default": {
         "thinking":     {},
@@ -89,6 +101,7 @@ _THINKING_EXTRA_BODY: dict[str, dict] = {
     "kimi":     {},                          # Kimi enables thinking by default
     "deepseek": {"thinking": {"type": "enabled"}, "reasoning_effort": "high"},
     "gpt":      {},
+    "glm":      {"thinking": {"type": "enabled"}},
     # Claude Opus 4.6/4.7 + Sonnet 4.6: adaptive thinking is the recommended
     # mode (required on Opus 4.7). Auto-enables interleaved thinking.
     "claude":   {"thinking": {"type": "adaptive"}},

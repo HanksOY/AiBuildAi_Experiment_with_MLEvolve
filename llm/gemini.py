@@ -233,6 +233,7 @@ def generate(
     json_schema: dict | None = None,
     max_retries: int = 20,
     retry_delay: float = 3,
+    stage: str = "code",
 ) -> str:
     """Streaming text generation via Gemini API.
 
@@ -245,11 +246,16 @@ def generate(
         json_schema: Optional JSON schema for structured output.
         max_retries: Max retry attempts on failure.
         retry_delay: Seconds to wait between retries.
+        stage: which cfg.agent.<stage> block supplies the model name.
 
     Returns:
         The generated text (with <think> blocks stripped).
     """
     _setup_gemini_client(cfg)
+    # NOTE: _setup_gemini_client is @once, so the client's api_key/base_url are
+    # always the code stage's. Only the model name is stage-aware here; a
+    # feedback stage on a different Gemini endpoint would need that lifted.
+    stage_cfg = getattr(cfg.agent, stage, None) or cfg.agent.code
 
     # Convert dict/list prompts to markdown string
     if prompt is not None and not isinstance(prompt, str):
@@ -257,12 +263,15 @@ def generate(
 
     logger.info(f"generate prompt: {prompt}", extra={"verbose": True})
 
+    if max_tokens is None:
+        max_tokens = getattr(stage_cfg, "max_tokens", None) or 16384
+
     config_params = {
         "temperature": temperature if temperature is not None else 1.0,
-        "max_output_tokens": max_tokens if max_tokens is not None else 16384,
+        "max_output_tokens": max_tokens,
         "stop_sequences": stop_tokens,
     }
-    thinking_cfg = _build_thinking_config(cfg.agent.code.model, level="high")
+    thinking_cfg = _build_thinking_config(stage_cfg.model, level="high")
     if thinking_cfg is not None:
         config_params["thinking_config"] = thinking_cfg
 
@@ -272,7 +281,7 @@ def generate(
         logger.info("Enforcing JSON output with schema", extra={"verbose": True})
 
     generation_config = types.GenerateContentConfig(**config_params)
-    model_name = cfg.agent.code.model
+    model_name = stage_cfg.model
 
     for attempt in range(max_retries):
         try:

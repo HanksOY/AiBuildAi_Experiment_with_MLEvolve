@@ -77,11 +77,20 @@ class StepAgent:
             code = extract_code(completion_text)
             nl_text = extract_text_up_to_code(completion_text)
 
-            if code and nl_text:
+            # Usable code is the requirement; a missing prose preamble is not a
+            # failure. Responses that open straight with a ``` fence used to be
+            # discarded here and retried at full cost.
+            if code:
+                if not nl_text:
+                    logger.debug(f"No preamble text for {self.name}; using code only")
                 return nl_text, code
 
             logger.debug(f"Extraction retry for {self.name}...")
-        logger.warning(f"Code extraction failed after retries for {self.name}")
+        logger.warning(
+            f"Code extraction failed after {retries} retries for {self.name} "
+            f"(last response {len(completion_text or '')} chars) — "
+            f"usually a max_tokens truncation leaving the ``` fence unclosed"
+        )
         return "", completion_text  # type: ignore
 
     def _build_prompt(
@@ -291,12 +300,18 @@ class MetaAgent:
             code = extract_code(completion_text)
             nl_text = extract_text_up_to_code(completion_text)
 
-            if code and nl_text:
+            if code:
+                if not nl_text:
+                    logger.debug("No preamble text for MetaAgent merge; using code only")
                 return nl_text, code
 
             logger.debug("Extraction retry for MetaAgent merge...")
-        logger.warning("Code extraction failed after retries for MetaAgent merge")
-        return "", completion_text 
+        logger.warning(
+            f"Code extraction failed after {retries} retries for MetaAgent merge "
+            f"(last response {len(completion_text or '')} chars) — "
+            f"usually a max_tokens truncation leaving the ``` fence unclosed"
+        )
+        return "", completion_text
 
     def _build_merge_prompt(
         self,

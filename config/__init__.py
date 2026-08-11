@@ -34,6 +34,10 @@ class StageConfig:
     temp: float
     base_url: str
     api_key: str
+    # Output-token budget per request. On reasoning models (GLM, DeepSeek, Claude)
+    # this budget is shared with the reasoning tokens, so a limit that is too low
+    # truncates the visible answer mid-token and breaks code extraction.
+    max_tokens: int = 16384
 
 @dataclass
 class DecayConfig:
@@ -122,6 +126,14 @@ class InitSolutionConfig:
 
 
 @dataclass
+class PlanModeConfig:
+    # On by default: a run should not start without the user approving the plan.
+    # Unattended callers must opt out explicitly (see run_single_task.sh).
+    require_confirmation: bool = True
+    show_task_diff: bool = True
+
+
+@dataclass
 class Config(Hashable):
     data_dir: Path
     dataset_dir: Path
@@ -152,6 +164,7 @@ class Config(Hashable):
 
     use_grading_server: bool = True
     init_solution: InitSolutionConfig = field(default_factory=InitSolutionConfig)
+    plan_mode: PlanModeConfig = field(default_factory=PlanModeConfig)
 
 
 def _get_next_logindex(dir: Path) -> int:
@@ -167,9 +180,27 @@ def _get_next_logindex(dir: Path) -> int:
     return max_index + 1
 
 
+def _load_dotenv() -> None:
+    """Load repo-root .env so config.yaml can reference secrets via ${oc.env:...}.
+
+    Keeps API keys out of the git-tracked config file. Existing environment
+    variables win, so an exported key overrides the .env entry.
+    """
+    env_path = Path(__file__).parent.parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(env_path, override=False)
+    except ImportError:
+        logger.warning(f"python-dotenv not installed; ignoring {env_path}")
+
+
 def _load_cfg(
     path: Path = Path(__file__).parent / "config.yaml", use_cli_args=True
 ) -> Config:
+    _load_dotenv()
     cfg = OmegaConf.load(path)
     if use_cli_args:
         cfg = OmegaConf.merge(cfg, OmegaConf.from_cli())

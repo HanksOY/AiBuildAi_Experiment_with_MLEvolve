@@ -15,11 +15,21 @@ from utils.visualization import journal_to_string_tree
 from utils.seed import set_global_seed
 from engine.coldstart import build_guidance_description
 from utils.logging_config import setup_logging
+from utils.run_paths import print_output_paths, run_root, to_windows_path
+from utils.export_notebook import export_notebook
+from utils.data_preview import clean_task_desc
+from agents.plan_mode import run_plan_gate
+from agents.setup_agent import needs_setup, run_setup
 import torch
 
 
 
 def run():
+    # First run: no key means nothing below can work, so set one up before
+    # load_cfg() fails on a half-filled config.
+    if needs_setup():
+        if not run_setup():
+            return
     cfg = load_cfg()
     if cfg.torch_hub_dir:
         torch.hub.set_dir(cfg.torch_hub_dir)
@@ -37,6 +47,25 @@ def run():
     with Status("Preparing agent workspace (copying and extracting files) ..."):
         prep_agent_workspace(cfg)
 
+    print_output_paths(cfg)
+
+    # Plan gate. Runs after the workspace exists (clean_task_desc reads
+    # input/ for a sample submission) and before anything is spent on search.
+    cleaned_task_desc = task_desc
+    task_desc_is_clean = False
+    if cfg.plan_mode.require_confirmation:
+        cleaned_task_desc = clean_task_desc(task_desc, cfg)
+        # The gate returns the task description augmented with the user's
+        # answers and the approved plan, so what they agreed to is what the
+        # agents actually receive.
+        approved_task_desc = run_plan_gate(cfg, task_desc, cleaned_task_desc)
+        if approved_task_desc is None:
+            shutil.rmtree(cfg.workspace_dir, ignore_errors=True)
+            logger.info("Exiting at the plan gate; nothing was executed.")
+            return
+        cleaned_task_desc = approved_task_desc
+        task_desc_is_clean = True
+
     global_step = 0
 
     def cleanup():
@@ -47,9 +76,10 @@ def run():
 
     journal = Journal()
     agent = Agent(
-        task_desc=task_desc,
+        task_desc=cleaned_task_desc,
         cfg=cfg,
         journal=journal,
+        task_desc_is_clean=task_desc_is_clean,
     )
 
     interpreter = Interpreter(
@@ -64,6 +94,16 @@ def run():
         res = interpreter.run(*args, **kwargs)
         status.update("[green]Generating code...")
         return res
+
+    def export_final_notebook():
+        """Export the winning solution as a notebook. Never fatal to the run."""
+        try:
+            path = export_notebook(run_root(cfg))
+            logger.info(f"📓 Notebook exported: {to_windows_path(path)}")
+        except FileNotFoundError as e:
+            logger.info(f"Skipping notebook export: {e}")
+        except Exception as e:
+            logger.warning(f"Notebook export failed: {e}")
 
     def step_task(node=None):
         if node:
@@ -165,6 +205,7 @@ def run():
             logger.info("KeyboardInterrupt received, terminating subprocesses and shutting down...")
             interpreter.terminate_all_subprocesses()
             executor.shutdown(wait=False, cancel_futures=True) if sys.version_info >= (3, 9) else executor.shutdown(wait=False)
+            export_final_notebook()
             raise
         finally:
             if not interrupted:
@@ -173,7 +214,9 @@ def run():
         logger.info(f"✅ All steps completed in Phase 1 (total_steps={total_steps} <= initial_draft_count={initial_draft_count})")
 
     interpreter.cleanup_session(-1)
+    export_final_notebook()
+    print_output_paths(cfg)
 
 
-if __name__ == "__main__":    
+if __name__ == "__main__":
     run()

@@ -34,11 +34,14 @@ class AgentSearch:
             task_desc: str,
             cfg: Config,
             journal: Journal,
+            task_desc_is_clean: bool = False,
     ):
         self.cfg = cfg
         self.acfg = cfg.agent
         self.scfg = cfg.agent.search
-        self.task_desc = clean_task_desc(task_desc, cfg)
+        # Plan mode cleans the description up front so the rewrite can be shown
+        # to the user; don't pay for it (or re-run it) a second time here.
+        self.task_desc = task_desc if task_desc_is_clean else clean_task_desc(task_desc, cfg)
         self.journal = journal
         self.data_preview: str | None = None
         self.current_step = 0
