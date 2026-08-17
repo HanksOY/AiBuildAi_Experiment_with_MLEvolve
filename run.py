@@ -4,6 +4,7 @@ import sys
 import shutil
 import time
 import threading
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from engine.agent_search import AgentSearch as Agent
 from engine.executor import Interpreter
@@ -20,6 +21,8 @@ from utils.export_notebook import export_notebook
 from utils.data_preview import clean_task_desc
 from agents.plan_mode import run_plan_gate
 from agents.setup_agent import needs_setup, run_setup
+from agents.main_agent import ControlBus, MainAgent, render_status
+from rich.console import Console
 import torch
 
 
@@ -112,6 +115,28 @@ def run():
             logger.info(f"[step_task] Processing virtual root node.")
         return agent.step(exec_callback=exec_callback, node=node)
 
+    def step_task_from_seed(path):
+        """Start a fresh draft from a file the operator edited."""
+        logger.info(f"[step_task_from_seed] Drafting from {path}")
+        return agent.step(exec_callback=exec_callback, node=None, init_solution_path=path)
+
+    console = Console()
+    bus = ControlBus()
+    MainAgent(cfg, bus, console).start()
+    agent.control = bus  # lets a queued stop land inside a step, not just between them
+
+    def publish_snapshot(completed, total, running):
+        best = agent.best_node
+        bus.publish(
+            progress=f"{completed}/{total} steps",
+            running=running,
+            best_metric=best.metric.value if (best and best.metric) else None,
+            best_node=best.id if best else None,
+            elapsed=f"{(time.time() - agent.start_time) / 60:.0f} min",
+            nodes=len(journal),
+            branches=len(agent.branch_all_nodes),
+        )
+
     max_workers = interpreter.max_parallel_run
     total_steps = cfg.agent.steps
     initial_draft_count = cfg.agent.initial_drafts
@@ -130,6 +155,10 @@ def run():
             return agent.step(exec_callback=exec_callback, node=None, execute_immediately=False)
 
         for draft_idx in range(min(initial_draft_count, total_steps)):
+            # Drafts are generated sequentially, so this is a clean place to stop.
+            if bus.stop_requested:
+                logger.info("Stop requested during draft generation; moving on with what exists.")
+                break
             try:
                 logger.info(f"🔨 Generating draft {draft_idx + 1}/{min(initial_draft_count, total_steps)} (code only)")
                 cur_node = step_task_generate_only()
@@ -172,8 +201,39 @@ def run():
                     futures.add(executor.submit(step_task))
                     logger.info(f"📤 Submitted initial step_task to fill thread pool")
 
+            pending_seeds = []
+
+            def pump_commands():
+                """Drain queued operator commands. Runs on the loop thread, between steps."""
+                for action, payload in bus.drain():
+                    if action == "status":
+                        publish_snapshot(completed, total_steps, len(futures))
+                        render_status(bus, console)
+                    elif action == "seed":
+                        pending_seeds.append(payload["path"])
+                        logger.info(f"Operator queued a seed solution: {payload['path']}")
+                    elif action == "abort":
+                        logger.info("Operator requested abort; terminating subprocesses.")
+                        interpreter.terminate_all_subprocesses()
+                    elif action == "stop":
+                        logger.info("Operator requested stop; no further steps will be submitted.")
+
             while completed < total_steps:
                 done, _ = wait(futures, return_when=FIRST_COMPLETED, timeout=1.0)
+
+                # The 1s tick is the natural drain point: frequent enough to feel
+                # responsive, and always between step boundaries.
+                pump_commands()
+                publish_snapshot(completed, total_steps, len(futures))
+
+                if bus.abort_requested:
+                    logger.info("Aborting: cancelling outstanding work.")
+                    console.print("[red]Aborted. Saving what completed ...[/red]")
+                    break
+                if bus.stop_requested and not futures:
+                    logger.info("Stop requested and nothing is running; exiting the loop.")
+                    console.print("[yellow]Stopped.[/yellow]")
+                    break
 
                 if not done:
                     continue  # timeout, no completed futures, retry (allows SIGINT handling)
@@ -196,7 +256,16 @@ def run():
                         if completed == total_steps:
                             logger.info(journal_to_string_tree(journal))
 
-                    if completed + len(futures) < total_steps:
+                    # A queued stop means no new work, but whatever is already
+                    # running is allowed to finish and be saved.
+                    if bus.stop_requested:
+                        logger.info("Stop requested; not submitting further steps.")
+                    elif pending_seeds:
+                        seed = pending_seeds.pop(0)
+                        futures.add(executor.submit(step_task_from_seed, seed))
+                        logger.info(f"📤 Submitted operator seed: {seed}")
+                        console.print(f"[green]Started a draft from {Path(seed).name}[/green]")
+                    elif completed + len(futures) < total_steps:
                         futures.add(executor.submit(step_task, cur_node))
                         logger.info(f"📤 Submitted next task based on node {cur_node.id if cur_node else 'None'}")
                     logger.info(f"📊 Progress: {completed}/{total_steps} steps completed, {len(futures)} tasks running")
@@ -208,8 +277,15 @@ def run():
             export_final_notebook()
             raise
         finally:
-            if not interrupted:
+            if interrupted:
+                pass
+            elif bus.abort_requested:
+                # Training is already dead; drop anything still queued.
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
                 executor.shutdown(wait=True)
+            with lock:
+                save_run(cfg, journal)
     else:
         logger.info(f"✅ All steps completed in Phase 1 (total_steps={total_steps} <= initial_draft_count={initial_draft_count})")
 

@@ -143,6 +143,13 @@ class AgentSearch:
         result_node = None
         _root = False
 
+        # Cooperative cancellation. The operator's stop cannot interrupt an LLM
+        # call already in flight, but it can prevent the next one from starting.
+        control = getattr(self, "control", None)
+        if control is not None and control.stop_requested:
+            logger.info(f"[_run_single_step] Stop requested; skipping work for {parent_node.id}.")
+            return True, None
+
         if not parent_node.is_terminal:
             try:
                 if self.is_root(parent_node):

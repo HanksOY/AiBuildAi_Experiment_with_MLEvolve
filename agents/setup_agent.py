@@ -260,7 +260,23 @@ def check_settings_consistency(cfg) -> list[dict]:
     from omegaconf import OmegaConf
 
     def get(key):
-        return OmegaConf.select(cfg, key)
+        """Numeric settings are compared, so coerce them.
+
+        Some are declared as str in the config schema (cpu_number, start_cpu_id),
+        so they arrive as strings and would raise on comparison with an int.
+        """
+        value = OmegaConf.select(cfg, key)
+        if isinstance(value, bool) or value is None:
+            return value
+        if isinstance(value, str):
+            try:
+                return float(value) if "." in value else int(value)
+            except ValueError:
+                # Not a number, so it cannot take part in these comparisons.
+                # Treat it as unset rather than letting a str reach a `>`.
+                logger.warning(f"Setting {key} is not numeric ({value!r}); skipping its checks.")
+                return None
+        return value
 
     issues = []
     time_limit, exec_timeout = get("agent.time_limit"), get("exec.timeout")
@@ -401,7 +417,13 @@ def review_settings_for_plan(cfg, plan: str, console: Console) -> list[tuple[str
         "or list the numbers to apply, e.g. '1 3'[/dim]"
     )
     try:
-        reply = Prompt.ask("  >", default="a", show_default=False, console=console).strip().lower()
+        from agents.plan_mode import chat_prompt
+
+        reply = chat_prompt(
+            console,
+            hint="'a' apply all · 'k' keep all · or list numbers like '1 3'",
+            default="a",
+        ).lower()
     except (EOFError, KeyboardInterrupt):
         reply = "k"
 

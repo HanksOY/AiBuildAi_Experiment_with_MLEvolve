@@ -20,12 +20,14 @@ answer the prompts, so it aborts rather than starting an unapproved run.
 import difflib
 import json
 import logging
+import re
 import sys
 
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
+from rich.rule import Rule
 from rich.syntax import Syntax
 
 logger = logging.getLogger("MLEvolve")
@@ -37,6 +39,7 @@ from agents.setup_agent import (
     settings_summary,
 )
 
+MIN_QUESTIONS = 3
 MAX_QUESTIONS = 5
 
 QUESTION_SYSTEM_PROMPT = (
@@ -44,13 +47,18 @@ QUESTION_SYSTEM_PROMPT = (
     "model-search run. Before starting, you get to ask the task owner a few questions."
 )
 
-QUESTION_TEMPLATE = """Read the task below and decide what you genuinely still need to know.
+QUESTION_TEMPLATE = """Read the task below and decide what you still need to know.
 
-Ask ONLY about real ambiguities that would change how the run is executed and that the
-task description does not already answer. A detailed task description may leave nothing
-worth asking — returning zero questions is a correct and welcome answer. Never ask about
-something already specified (metric, split, feature count, file formats, and so on).
-Prefer one sharp question over five obvious ones. Ask at most {max_q}.
+Ask between {min_q} and {max_q} questions. Two kinds are worth asking:
+
+1. Genuine ambiguities the task description does not answer.
+2. Consequential choices where more than one defensible option exists and the owner's
+   preference should decide it — feature representation, which model families to
+   prioritise, how to trade recall against precision, how much compute to spend on
+   tuning versus breadth, whether to ship a single model or an ensemble.
+
+Never ask about something already specified (metric, split, feature count, file formats).
+Every question must change what the run actually does; skip anything cosmetic.
 
 Reply with JSON only, in this exact shape:
 
@@ -66,8 +74,7 @@ Reply with JSON only, in this exact shape:
 }}
 
 Each question needs 3 to 5 concrete, mutually exclusive options. "recommended" is the
-0-based index of the option you would choose and must be a valid index. If nothing is
-genuinely ambiguous, reply exactly: {{"questions": []}}
+0-based index of the option you would choose and must be a valid index.
 
 The run is already configured as follows. Do not ask about anything settled here
 unless the task description contradicts it; if you do ask about one of these, state
@@ -144,6 +151,176 @@ Keep the whole plan under 400 words. Do not write code.
 # Task
 {task_desc}
 """
+
+
+ASK_BACK_SYSTEM = (
+    "You are interviewing the owner of a machine learning task before a long run starts. "
+    "They may answer your question, or they may ask you something about it first."
+)
+
+ASK_BACK_TEMPLATE = """You asked the task owner this question:
+
+  {question}
+  Options: {options}
+
+They replied:
+
+  {message}
+
+Decide whether that reply answers your question, or asks you something about it.
+
+Reply with JSON only:
+
+{{
+  "intent": "answer" | "question",
+  "reply": "your response, only when intent is question"
+}}
+
+Choose "answer" when the reply names one of the options, or states any preference,
+decision or instruction — however informally, and even if it also adds commentary.
+"Option 1 please", "keep the raw counts", "whatever you think best", and "do 2 but
+watch the imbalance" are all answers.
+
+Choose "question" only when they are clearly asking you something rather than telling
+you something: they want clarification, an example, a definition, or the consequences
+of an option, and have not indicated a choice. Then "reply" must actually help —
+explain the choice in plain terms with a concrete example, in three or four sentences.
+"""
+
+CHAT_SYSTEM = (
+    "You are the planning assistant for an automated machine learning run. The plan has "
+    "been drafted and the operator is reviewing it. You either answer their question or "
+    "recognise that they are asking for the plan to change."
+)
+
+CHAT_TEMPLATE = """The operator typed something while reviewing the plan below. Decide what it is.
+
+Reply with JSON only:
+
+{{
+  "intent": "question" | "revision",
+  "reply": "your answer, two or three sentences, only when intent is question"
+}}
+
+Use "question" when they are asking about the plan, the task, the run, or you — anything
+that should be answered without altering the plan. Use "revision" only when they are
+asking for the plan itself to change. When unsure, choose "question": answering is
+harmless, silently rewriting the plan is not.
+
+# The plan under review
+{plan}
+
+# What the operator typed
+{message}
+"""
+
+
+def _discard_typeahead() -> None:
+    """Drop anything typed while the previous step was still working.
+
+    Terminals buffer keystrokes, so text entered during a model call is handed to
+    the *next* prompt. That silently turns an idle thought into an answer for a
+    question that had not been asked yet.
+    """
+    try:
+        import termios
+
+        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    except Exception:
+        pass  # not a POSIX terminal; nothing buffered to drop
+
+
+def chat_prompt(console: Console, hint: str = "", default: str = "") -> str:
+    """A bordered input area, so typing feels like a chat box rather than a bare prompt.
+
+    A terminal cannot anchor a box to the bottom of the screen without a full TUI
+    framework, so this draws the frame around the cursor instead: rule, prompt,
+    rule. Same affordance, no extra dependency.
+    """
+    _discard_typeahead()
+    console.print()
+    console.print(Rule(style="grey39"))
+    if hint:
+        console.print(f"[dim]{hint}[/dim]")
+    try:
+        answer = Prompt.ask("[bold cyan]>[/bold cyan]", default=default,
+                            show_default=False, console=console)
+    finally:
+        console.print(Rule(style="grey39"))
+    return answer.strip()
+
+
+def interpret_answer_input(cfg, message: str, question: dict) -> tuple[str, str]:
+    """Decide whether the user answered the question or asked about it.
+
+    Without this, "I don't get what you are asking" is stored as the answer and
+    the run proceeds on it.
+    """
+    from llm import generate
+    from utils.response import extract_review
+
+    # "option 2", "2)", "#3" — unambiguous, so resolve without a model call.
+    picked = re.match(r"^\s*(?:option|opt|#)?\s*([1-9])\b", message, re.IGNORECASE)
+    if picked:
+        index = int(picked.group(1))
+        if 1 <= index <= len(question["options"]):
+            return "answer", question["options"][index - 1]
+
+    try:
+        raw = generate(
+            prompt={
+                "system": ASK_BACK_SYSTEM,
+                "user": ASK_BACK_TEMPLATE.format(
+                    question=question["question"],
+                    options="; ".join(question["options"]),
+                    message=message,
+                ),
+            },
+            cfg=cfg,
+            stage="feedback",
+        )
+        data = extract_review(raw)
+    except Exception as e:
+        logger.warning(f"Could not interpret the reply: {e}")
+        return "answer", ""
+
+    if not isinstance(data, dict):
+        return "answer", ""
+    intent = str(data.get("intent", "answer")).lower()
+    reply = str(data.get("reply", "")).strip()
+    if intent == "question" and reply:
+        return "question", reply
+    return "answer", reply
+
+
+def interpret_review_input(cfg, message: str, plan: str) -> tuple[str, str]:
+    """Classify review input as a question or a revision request.
+
+    Without this, anything typed is taken as a revision — so asking a question
+    silently rewrites the plan around it.
+    """
+    from llm import generate
+    from utils.response import extract_review
+
+    try:
+        raw = generate(
+            prompt={"system": CHAT_SYSTEM,
+                    "user": CHAT_TEMPLATE.format(plan=plan, message=message)},
+            cfg=cfg,
+            stage="feedback",
+        )
+        data = extract_review(raw)
+    except Exception as e:
+        logger.warning(f"Could not interpret review input: {e}")
+        return "revision", ""
+
+    if not isinstance(data, dict):
+        return "revision", ""
+    intent = str(data.get("intent", "revision")).lower()
+    reply = str(data.get("reply", "")).strip()
+    if intent == "question" and reply:
+        return "question", reply
+    return "revision", reply
 
 
 # ── task description handling ────────────────────────────────────────────────
@@ -248,6 +425,7 @@ def generate_questions(cfg, task_desc) -> list[dict]:
             prompt={
                 "system": QUESTION_SYSTEM_PROMPT,
                 "user": QUESTION_TEMPLATE.format(
+                    min_q=MIN_QUESTIONS,
                     max_q=MAX_QUESTIONS,
                     task_desc=_as_text(task_desc),
                     settings=settings_summary(cfg),
@@ -367,7 +545,7 @@ def resolve_conflicts(cfg, conflicts: list[dict], console: Console) -> list[tupl
     return notes
 
 
-def ask_questions(questions: list[dict], console: Console) -> list[tuple[str, str]]:
+def ask_questions(cfg, questions: list[dict], console: Console) -> list[tuple[str, str]]:
     """Put each question to the user. Returns the (question, answer) pairs they answered."""
     if not questions:
         console.print(
@@ -394,24 +572,37 @@ def ask_questions(questions: list[dict], console: Console) -> list[tuple[str, st
                   border_style="cyan", expand=False)
         )
 
-        try:
-            reply = Prompt.ask("  Your answer", default="", show_default=False, console=console).strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print("\n[yellow]Skipping remaining questions.[/yellow]")
-            break
+        # Stay on this question until it is actually answered or skipped: asking
+        # about it must not be recorded as the answer to it.
+        answer = None
+        while answer is None:
+            try:
+                reply = chat_prompt(
+                    console,
+                    hint="Pick a number · type your own answer · ask me about it · "
+                         "Enter = recommended · 's' = skip",
+                )
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[yellow]Skipping remaining questions.[/yellow]")
+                return answers
 
-        if reply.lower() in {"s", "skip"}:
-            console.print("  [dim]skipped[/dim]\n")
-            continue
-        if not reply:
-            answer = q["options"][q["recommended"]]
-        elif reply.isdigit() and 1 <= int(reply) <= len(q["options"]):
-            answer = q["options"][int(reply) - 1]
-        else:
-            answer = reply  # free text
+            if reply.lower() in {"s", "skip"}:
+                console.print("  [dim]skipped[/dim]\n")
+                break
+            if not reply:
+                answer = q["options"][q["recommended"]]
+            elif reply.isdigit() and 1 <= int(reply) <= len(q["options"]):
+                answer = q["options"][int(reply) - 1]
+            else:
+                intent, response = interpret_answer_input(cfg, reply, q)
+                if intent == "question":
+                    console.print(Panel(response, border_style="cyan", expand=False))
+                    continue  # ask the same question again
+                answer = reply
 
-        console.print(f"  [green]->[/green] {answer}\n")
-        answers.append((q["question"], answer))
+        if answer is not None:
+            console.print(f"  [green]->[/green] {answer}\n")
+            answers.append((q["question"], answer))
 
     return answers
 
@@ -465,23 +656,27 @@ def review_plan(cfg, cleaned_task_desc, answers, console: Console) -> tuple[str,
     console.print("\n[dim]Drafting the run plan ...[/dim]")
     plan = generate_plan(cfg, cleaned_task_desc, answers)
 
+    show_plan = True
     while True:
-        console.print(
-            Panel(
-                Markdown(plan),
-                title="[bold]Proposed plan[/bold]",
-                subtitle=f"[dim]{cfg.exp_name}[/dim]",
-                border_style="cyan",
-                expand=False,
+        # Only re-print when it actually changed; answering a question should not
+        # scroll the whole plan past again.
+        if show_plan:
+            console.print(
+                Panel(
+                    Markdown(plan),
+                    title="[bold]Proposed plan[/bold]",
+                    subtitle=f"[dim]{cfg.exp_name}[/dim]",
+                    border_style="cyan",
+                    expand=False,
+                )
             )
-        )
-        console.print(
-            "\n[bold]Anything to change?[/bold] "
-            "[dim]Type your feedback and the plan is redrafted. "
-            "'go' to start the run, 'q' to quit.[/dim]"
-        )
+        show_plan = True
         try:
-            reply = Prompt.ask("  >", default="go", show_default=False, console=console).strip()
+            reply = chat_prompt(
+                console,
+                hint="Ask a question, request a change, or type 'go' to start · 'q' to quit",
+                default="",
+            )
         except (EOFError, KeyboardInterrupt):
             console.print("\n[red]Aborted at the plan gate.[/red]")
             return None
@@ -491,6 +686,14 @@ def review_plan(cfg, cleaned_task_desc, answers, console: Console) -> tuple[str,
             return plan, feedback
         if low in {"q", "n", "no", "quit", "stop"}:
             return None
+
+        # Distinguish a question from a change request. Treating everything as a
+        # revision means asking "who are you" silently rewrites the plan.
+        intent, answer = interpret_review_input(cfg, reply, plan)
+        if intent == "question":
+            console.print(Panel(answer, border_style="cyan", expand=False))
+            show_plan = False  # plan unchanged, don't reprint it
+            continue
 
         feedback.append(reply)
         logger.info(f"Plan revision requested: {reply}")
@@ -585,7 +788,7 @@ def run_plan_gate(cfg, original_task_desc, cleaned_task_desc):
         show_task_diff(original_task_desc, cleaned_task_desc, console)
 
     console.print("\n[dim]Checking whether anything needs clarifying ...[/dim]")
-    answers = ask_questions(generate_questions(cfg, cleaned_task_desc), console)
+    answers = ask_questions(cfg, generate_questions(cfg, cleaned_task_desc), console)
 
     # An answer may contradict a configured setting. Never silently pick a
     # winner — put the conflict to the user and apply whichever they choose.
