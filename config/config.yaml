@@ -259,6 +259,16 @@ plan_mode:
   show_task_diff: true
 
 # ============================================================
+#  Draft review
+# ============================================================
+draft_review:
+  # Pause after each initial draft is written, before it runs, so you can
+  # read the code and accept, edit or reject it. Initial drafts only.
+  # Needs a terminal; unattended runs must pass draft_review.enabled=False.
+  enabled: true
+  max_regenerations: 2
+
+# ============================================================
 #  Cold-start knowledge
 # ============================================================
 coldstart:

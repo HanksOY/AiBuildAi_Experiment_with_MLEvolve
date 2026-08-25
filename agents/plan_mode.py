@@ -32,12 +32,17 @@ from rich.syntax import Syntax
 
 logger = logging.getLogger("MLEvolve")
 
+from agents.prompt_commands import ask_command, chat_prompt, render_help
 from agents.setup_agent import (
     OVERRIDABLE_KEYS,
     coerce_value,
     review_settings_for_plan,
     settings_summary,
 )
+
+# Returned by a step the user stepped back out of, so the caller reruns the
+# previous one instead of treating it as a normal result.
+BACK = "__back__"
 
 MIN_QUESTIONS = 3
 MAX_QUESTIONS = 5
@@ -215,42 +220,8 @@ harmless, silently rewriting the plan is not.
 """
 
 
-def _discard_typeahead() -> None:
-    """Drop anything typed while the previous step was still working.
-
-    Terminals buffer keystrokes, so text entered during a model call is handed to
-    the *next* prompt. That silently turns an idle thought into an answer for a
-    question that had not been asked yet.
-    """
-    try:
-        import termios
-
-        termios.tcflush(sys.stdin, termios.TCIFLUSH)
-    except Exception:
-        pass  # not a POSIX terminal; nothing buffered to drop
-
-
-def chat_prompt(console: Console, hint: str = "", default: str = "") -> str:
-    """A bordered input area, so typing feels like a chat box rather than a bare prompt.
-
-    A terminal cannot anchor a box to the bottom of the screen without a full TUI
-    framework, so this draws the frame around the cursor instead: rule, prompt,
-    rule. Same affordance, no extra dependency.
-    """
-    _discard_typeahead()
-    console.print()
-    console.print(Rule(style="grey39"))
-    if hint:
-        console.print(f"[dim]{hint}[/dim]")
-    try:
-        answer = Prompt.ask("[bold cyan]>[/bold cyan]", default=default,
-                            show_default=False, console=console)
-    finally:
-        console.print(Rule(style="grey39"))
-    return answer.strip()
-
-
-def interpret_answer_input(cfg, message: str, question: dict) -> tuple[str, str]:
+def interpret_answer_input(cfg, message: str, question: dict,
+                           force_question: bool = False) -> tuple[str, str]:
     """Decide whether the user answered the question or asked about it.
 
     Without this, "I don't get what you are asking" is stored as the answer and
@@ -293,7 +264,8 @@ def interpret_answer_input(cfg, message: str, question: dict) -> tuple[str, str]
     return "answer", reply
 
 
-def interpret_review_input(cfg, message: str, plan: str) -> tuple[str, str]:
+def interpret_review_input(cfg, message: str, plan: str,
+                           force_question: bool = False) -> tuple[str, str]:
     """Classify review input as a question or a revision request.
 
     Without this, anything typed is taken as a revision — so asking a question
@@ -318,6 +290,8 @@ def interpret_review_input(cfg, message: str, plan: str) -> tuple[str, str]:
         return "revision", ""
     intent = str(data.get("intent", "revision")).lower()
     reply = str(data.get("reply", "")).strip()
+    if force_question:
+        return "question", reply or "I could not answer that."
     if intent == "question" and reply:
         return "question", reply
     return "revision", reply
@@ -574,34 +548,44 @@ def ask_questions(cfg, questions: list[dict], console: Console) -> list[tuple[st
 
         # Stay on this question until it is actually answered or skipped: asking
         # about it must not be recorded as the answer to it.
+        # Stay on this question until it is answered, skipped, or stepped back
+        # from. Asking about it must never be recorded as the answer to it.
         answer = None
         while answer is None:
             try:
-                reply = chat_prompt(
+                command = ask_command(
                     console,
-                    hint="Pick a number · type your own answer · ask me about it · "
-                         "Enter = recommended · 's' = skip",
+                    hint="a number · your own answer · /ask about it · /skip · /back · Enter = recommended",
                 )
             except (EOFError, KeyboardInterrupt):
                 console.print("\n[yellow]Skipping remaining questions.[/yellow]")
                 return answers
 
-            if reply.lower() in {"s", "skip"}:
-                console.print("  [dim]skipped[/dim]\n")
+            if command.kind == "skip":
+                console.print("  [dim]skipped[/dim]")
                 break
-            if not reply:
+            if command.kind == "quit":
+                return answers
+            if command.kind == "back":
+                return BACK
+            if command.kind == "empty":
                 answer = q["options"][q["recommended"]]
-            elif reply.isdigit() and 1 <= int(reply) <= len(q["options"]):
-                answer = q["options"][int(reply) - 1]
+            elif command.kind == "ask":
+                _, response = interpret_answer_input(cfg, command.text, q, force_question=True)
+                console.print(Panel(response, border_style="cyan", expand=False))
+            elif command.kind == "change":
+                answer = command.text
+            elif command.text.isdigit() and 1 <= int(command.text) <= len(q["options"]):
+                answer = q["options"][int(command.text) - 1]
             else:
-                intent, response = interpret_answer_input(cfg, reply, q)
+                intent, response = interpret_answer_input(cfg, command.text, q)
                 if intent == "question":
                     console.print(Panel(response, border_style="cyan", expand=False))
-                    continue  # ask the same question again
-                answer = reply
+                    continue  # same question again
+                answer = response or command.text
 
         if answer is not None:
-            console.print(f"  [green]->[/green] {answer}\n")
+            console.print(f"  [green]->[/green] {answer}")
             answers.append((q["question"], answer))
 
     return answers
@@ -672,32 +656,39 @@ def review_plan(cfg, cleaned_task_desc, answers, console: Console) -> tuple[str,
             )
         show_plan = True
         try:
-            reply = chat_prompt(
+            command = ask_command(
                 console,
-                hint="Ask a question, request a change, or type 'go' to start · 'q' to quit",
-                default="",
+                hint="/go start the run · /change <what to change> · /ask a question · /back · /quit",
             )
         except (EOFError, KeyboardInterrupt):
-            console.print("\n[red]Aborted at the plan gate.[/red]")
+            console.print("[red]Aborted at the plan gate.[/red]")
             return None
 
-        low = reply.lower()
-        if low in {"go", "y", "yes", "start", ""}:
+        if command.kind in {"go", "empty"}:
             return plan, feedback
-        if low in {"q", "n", "no", "quit", "stop"}:
+        if command.kind == "quit":
             return None
-
-        # Distinguish a question from a change request. Treating everything as a
-        # revision means asking "who are you" silently rewrites the plan.
-        intent, answer = interpret_review_input(cfg, reply, plan)
-        if intent == "question":
-            console.print(Panel(answer, border_style="cyan", expand=False))
-            show_plan = False  # plan unchanged, don't reprint it
+        if command.kind == "back":
+            return BACK
+        if command.kind == "ask":
+            _, response = interpret_review_input(cfg, command.text, plan, force_question=True)
+            console.print(Panel(response, border_style="cyan", expand=False))
+            show_plan = False
             continue
 
-        feedback.append(reply)
-        logger.info(f"Plan revision requested: {reply}")
-        console.print("\n[dim]Redrafting with your feedback ...[/dim]")
+        request = command.text
+        if command.kind == "raw":
+            # Distinguish a question from a change request; treating everything
+            # as a revision means asking "who are you" rewrites the plan.
+            intent, response = interpret_review_input(cfg, request, plan)
+            if intent == "question":
+                console.print(Panel(response, border_style="cyan", expand=False))
+                show_plan = False
+                continue
+
+        feedback.append(request)
+        logger.info(f"Plan revision requested: {request}")
+        console.print("[dim]Redrafting with your feedback ...[/dim]")
         plan = generate_plan(cfg, cleaned_task_desc, answers, feedback)
 
 
@@ -787,30 +778,125 @@ def run_plan_gate(cfg, original_task_desc, cleaned_task_desc):
     if getattr(pcfg, "show_task_diff", True):
         show_task_diff(original_task_desc, cleaned_task_desc, console)
 
-    console.print("\n[dim]Checking whether anything needs clarifying ...[/dim]")
-    answers = ask_questions(cfg, generate_questions(cfg, cleaned_task_desc), console)
+    # Phase machine, so /back steps to the previous phase instead of only
+    # working inside one. Questions -> plan review -> settings review.
+    questions = None
+    answers: list[tuple[str, str]] = []
+    plan = ""
+    phase = "questions"
 
-    # An answer may contradict a configured setting. Never silently pick a
-    # winner — put the conflict to the user and apply whichever they choose.
-    if answers:
-        console.print("[dim]Checking your answers against the run settings ...[/dim]")
-        answers += resolve_conflicts(cfg, detect_conflicts(cfg, answers), console)
+    while phase != "done":
+        if phase == "questions":
+            if questions is None:
+                console.print("\n[dim]Checking whether anything needs clarifying ...[/dim]")
+                questions = generate_questions(cfg, cleaned_task_desc)
+            answers = ask_questions(cfg, questions, console)
+            if answers is BACK:
+                console.print("[dim]Nothing before this step — starting from the questions.[/dim]")
+                answers = []
+                continue
+            # An answer may contradict a configured setting. Never silently pick
+            # a winner: put the conflict to the user and apply their choice.
+            if answers:
+                console.print("[dim]Checking your answers against the run settings ...[/dim]")
+                answers += resolve_conflicts(cfg, detect_conflicts(cfg, answers), console)
+            phase = "plan"
 
-    reviewed = review_plan(cfg, cleaned_task_desc, answers, console)
-    if reviewed is None:
-        console.print("[red]Stopped. Nothing was executed.[/red]")
-        logger.info("User rejected the plan; exiting before the search started.")
-        return None
+        elif phase == "plan":
+            reviewed = review_plan(cfg, cleaned_task_desc, answers, console)
+            if reviewed is BACK:
+                phase = "questions"
+                continue
+            if reviewed is None:
+                console.print("[red]Stopped. Nothing was executed.[/red]")
+                logger.info("User rejected the plan; exiting before the search started.")
+                return None
+            plan, feedback = reviewed
+            phase = "settings"
 
-    plan, feedback = reviewed
-
-    # Now that a plan exists there is finally something to tune the run's
-    # parameters against, so hand them back to the config agent for a second
-    # look. Defaults were deliberately left alone until this point.
-    answers += review_settings_for_plan(cfg, plan, console)
+        elif phase == "settings":
+            # Only now does a plan exist to tune the run's parameters against.
+            notes = review_settings_for_plan(cfg, plan, console)
+            if notes is None:
+                phase = "plan"
+                continue
+            answers += notes
+            phase = "done"
 
     save_plan_transcript(cfg, diff, answers, plan)
     logger.info(f"Plan approved after {len(feedback)} revision(s); {len(answers)} clarification(s).")
     console.print("[green]Plan approved — starting the search.[/green]")
 
     return build_augmented_task_desc(cleaned_task_desc, answers, plan)
+
+
+def _demo() -> None:
+    """Exercise the real gate with canned content, so commands can be tested fast.
+
+    Question drafting, plan drafting and setting recommendations are stubbed, so
+    the whole flow is instant and free. Everything else is the real code path —
+    the same parser, the same phase machine, the same /back transitions — so
+    what you type here behaves exactly as it will in a run. /ask still calls the
+    model, because answering you is the thing being tested.
+    """
+    import agents.setup_agent as setup_agent
+    from config import _load_cfg
+
+    console = Console()
+    cfg = _load_cfg(use_cli_args=False)
+    cfg.plan_mode.require_confirmation = True
+
+    canned_questions = [
+        {
+            "question": "How should the ICD-9 count columns be represented as features?",
+            "why": "Changes preprocessing and can swing PRAUC, especially for linear models.",
+            "options": ["Use raw integer counts as-is", "Binarize to presence/absence",
+                        "Apply log(1+count)", "Try several and pick by cross-validation"],
+            "recommended": 3,
+        },
+        {
+            "question": "Should the submission come from one model or an ensemble?",
+            "why": "An ensemble needs blending logic and changes how the threshold is chosen.",
+            "options": ["Single best by CV PRAUC", "Ensemble of the top 3",
+                        "Try both, submit whichever scores higher"],
+            "recommended": 2,
+        },
+    ]
+    canned_plan = (
+        "## Understanding\nPredict meningitis from ICD-9 counts; ranked by mean "
+        "out-of-fold CV PRAUC.\n\n## Validation protocol\nStratified 20% hold-out, "
+        "then stratified 5-fold CV on the remainder, seed 42.\n\n## Modelling approach\n"
+        "1. Logistic regression  2. LightGBM  3. Extra-trees\n\n## Risks\n"
+        "Residual leakage; hold-out contamination; high variance at 0.46% prevalence."
+    )
+
+    plan_mode = sys.modules[__name__]
+    plan_mode.generate_questions = lambda *a, **k: canned_questions
+    plan_mode.generate_plan = lambda *a, **k: canned_plan
+    plan_mode.detect_conflicts = lambda *a, **k: []
+    setup_agent.recommend_settings = lambda *a, **k: []
+
+    console.print(
+        Panel(
+            "Canned questions and plan, so nothing waits on generation.\n\n"
+            "Try: a number · [cyan]/ask[/cyan] something · [cyan]/back[/cyan] · "
+            "[cyan]/skip[/cyan] · [cyan]/help[/cyan] · [cyan]/go[/cyan] · [cyan]/quit[/cyan]\n"
+            "[dim]/back from the settings table returns to the plan, and from the plan "
+            "returns to the questions.[/dim]",
+            title="[bold]Plan gate demo[/bold]",
+            border_style="green",
+            expand=False,
+        )
+    )
+
+    task = "Predict meningitis from per-patient ICD-9 diagnosis code counts."
+    result = run_plan_gate(cfg, task, task)
+    if result is None:
+        console.print("\n[red]Gate returned None — the run would not start.[/red]")
+    else:
+        console.print(f"\n[green]Gate approved.[/green] Task description is now "
+                      f"{len(result)} chars (was {len(task)}).")
+
+
+if __name__ == "__main__":
+    _demo()

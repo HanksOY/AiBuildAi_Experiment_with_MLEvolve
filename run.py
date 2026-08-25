@@ -22,6 +22,7 @@ from utils.data_preview import clean_task_desc
 from agents.plan_mode import run_plan_gate
 from agents.setup_agent import needs_setup, run_setup
 from agents.main_agent import ControlBus, MainAgent, render_status
+from agents.draft_review import review_draft, ACCEPT, REJECT, ABORT
 from rich.console import Console
 import torch
 
@@ -132,7 +133,7 @@ def run():
             running=running,
             best_metric=best.metric.value if (best and best.metric) else None,
             best_node=best.id if best else None,
-            elapsed=f"{(time.time() - agent.start_time) / 60:.0f} min",
+            elapsed=f"{agent.elapsed() / 60:.0f} min",
             nodes=len(journal),
             branches=len(agent.branch_all_nodes),
         )
@@ -154,19 +155,64 @@ def run():
             logger.info(f"[step_task_generate_only] Generating draft from virtual root")
             return agent.step(exec_callback=exec_callback, node=None, execute_immediately=False)
 
-        for draft_idx in range(min(initial_draft_count, total_steps)):
+        def discard_draft(node):
+            """Unhook a rejected draft so the tree does not keep a child that never runs."""
+            try:
+                agent.virtual_root.children.discard(node)
+            except AttributeError:
+                pass
+            agent.virtual_root.sub_expected_child_count()
+            branch = agent.branch_all_nodes.get(getattr(node, "branch_id", None))
+            if branch and node in branch:
+                branch.remove(node)
+
+        target_drafts = min(initial_draft_count, total_steps)
+        max_regen = getattr(cfg.draft_review, "max_regenerations", 2)
+
+        for draft_idx in range(target_drafts):
             # Drafts are generated sequentially, so this is a clean place to stop.
             if bus.stop_requested:
                 logger.info("Stop requested during draft generation; moving on with what exists.")
                 break
-            try:
-                logger.info(f"🔨 Generating draft {draft_idx + 1}/{min(initial_draft_count, total_steps)} (code only)")
-                cur_node = step_task_generate_only()
-                pending_draft_nodes.append(cur_node)
-                logger.info(f"✅ Draft {draft_idx + 1} code generated: node.id={cur_node.id}, added to virtual_root.children")
 
-            except Exception as e:
-                logger.exception(f"❌ Exception during draft {draft_idx + 1} generation: {e}")
+            attempts = 0
+            while True:
+                try:
+                    logger.info(f"Generating draft {draft_idx + 1}/{target_drafts} (code only)")
+                    cur_node = step_task_generate_only()
+                except Exception as e:
+                    logger.exception(f"Exception during draft {draft_idx + 1} generation: {e}")
+                    break
+
+                verdict = review_draft(agent, cur_node, draft_idx + 1, target_drafts, console)
+
+                if verdict == ACCEPT:
+                    pending_draft_nodes.append(cur_node)
+                    logger.info(f"Draft {draft_idx + 1} accepted: node.id={cur_node.id}")
+                    break
+
+                if verdict == ABORT:
+                    logger.info("User aborted at the draft review; stopping the run.")
+                    bus.request_stop()
+                    discard_draft(cur_node)
+                    break
+
+                # Rejected. Carry any feedback into the replacement.
+                discard_draft(cur_node)
+                agent.draft_feedback = getattr(cur_node, "review_feedback", None)
+                attempts += 1
+                if attempts > max_regen:
+                    console.print(
+                        f"[yellow]Draft {draft_idx + 1} rejected {attempts} times; "
+                        f"moving on without it.[/yellow]"
+                    )
+                    logger.info(f"Draft {draft_idx + 1} abandoned after {attempts} rejections.")
+                    break
+                console.print(f"[dim]Regenerating draft {draft_idx + 1} ...[/dim]")
+
+            agent.draft_feedback = None
+            if bus.stop_requested:
+                break
 
         logger.info(f"✅ Phase 1 complete: {len(pending_draft_nodes)} draft codes generated")
 

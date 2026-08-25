@@ -120,6 +120,17 @@ def run(agent, init_solution_path: Optional[str] = None) -> SearchNode:
             "- **FINAL OUTPUT**: The VERY LAST line of execution MUST be `print(f'Final Validation Score: {score}')`. This is required for the score parser."
         ]
     }
+    # A draft the user rejected leaves feedback here. It has to outrank the
+    # generic guidance, so it goes in last and says so explicitly.
+    review_feedback = getattr(agent, "draft_feedback", None)
+    if review_feedback:
+        prompt["Instructions"]["Reviewer feedback (highest priority)"] = [
+            "The task owner rejected your previous draft and asked for this:\n",
+            f"  {review_feedback}\n",
+            "Address it directly. Where it conflicts with any other guidance above, "
+            "the owner's instruction wins.\n",
+        ]
+
     prompt["Instructions"] |= get_impl_guideline_from_agent(agent)
     prompt["Instructions"] |= prompt_leakage_prevention()
 

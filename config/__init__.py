@@ -126,6 +126,14 @@ class InitSolutionConfig:
 
 
 @dataclass
+class DraftReviewConfig:
+    # Pause after each initial draft is written, before it runs.
+    enabled: bool = True
+    # Cap on regenerations per draft slot, so a rejection loop cannot run forever.
+    max_regenerations: int = 2
+
+
+@dataclass
 class PlanModeConfig:
     # On by default: a run should not start without the user approving the plan.
     # Unattended callers must opt out explicitly (see run_single_task.sh).
@@ -165,6 +173,7 @@ class Config(Hashable):
     use_grading_server: bool = True
     init_solution: InitSolutionConfig = field(default_factory=InitSolutionConfig)
     plan_mode: PlanModeConfig = field(default_factory=PlanModeConfig)
+    draft_review: DraftReviewConfig = field(default_factory=DraftReviewConfig)
 
 
 def _get_next_logindex(dir: Path) -> int:

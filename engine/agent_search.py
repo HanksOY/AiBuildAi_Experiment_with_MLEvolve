@@ -57,6 +57,9 @@ class AgentSearch:
         self.journal_lock = threading.Lock()
         self.save_node_lock = threading.Lock()
         self.start_time = time.time()
+        # Seconds spent blocked on the user. Subtracted from every elapsed
+        # calculation so reading a draft does not consume the search budget.
+        self.paused_seconds = 0.0
         self.use_stepwise_generation = getattr(self.acfg, "use_stepwise_generation", True)
 
         self.next_branch_id = 1
@@ -106,6 +109,13 @@ class AgentSearch:
                 self.global_memory = None
         else:
             logger.info("[AgentSearch] Global memory is disabled by config")
+
+    def elapsed(self, since: float | None = None) -> float:
+        """Seconds of actual search time, excluding time spent waiting on the user."""
+        origin = since if since is not None else self.start_time
+        if origin is None:
+            return 0.0
+        return max(0.0, time.time() - origin - self.paused_seconds)
 
     def _serialize_prompt(self, prompt_complete) -> str | None:
         """Serialize prompt (str or dict) to string for saving in node."""
@@ -172,7 +182,7 @@ class AgentSearch:
                 elif parent_node.is_buggy is False:
                     can_use_fusion = False
                     if self.search_start_time:
-                        elapsed_time = time.time() - self.search_start_time
+                        elapsed_time = self.elapsed(self.search_start_time)
                         if elapsed_time >= self.acfg.time_limit / 2:
                             can_use_fusion = True
                     is_from_topk = getattr(parent_node, '_topk_triggered', False)

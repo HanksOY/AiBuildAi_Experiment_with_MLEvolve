@@ -383,6 +383,48 @@ def recommend_settings(cfg, plan: str) -> list[dict]:
     return _collect_proposals(cfg, raw, "recommendations", "suggested_value", "reason")
 
 
+SETTINGS_QA_SYSTEM = (
+    "You explain the settings of an automated machine learning run to its owner, "
+    "plainly and without jargon."
+)
+
+SETTINGS_QA_TEMPLATE = """The owner is reviewing these proposed setting changes and asked a question.
+
+Answer it directly in two to four sentences. Say what the number means, in what unit, and
+what changes if they accept or decline. Do not restate the whole table.
+
+# Proposed changes
+{proposals}
+
+# Their question
+{question}
+"""
+
+
+def answer_settings_question(cfg, question: str, proposals: list[dict], console: Console) -> None:
+    """Answer a question about the proposed settings without changing anything."""
+    from llm import generate
+
+    rendered = "\n".join(
+        f"{i}. {p['key']}: currently {p['current']}, suggested {p['new']} — {p['note']}"
+        for i, p in enumerate(proposals, 1)
+    )
+    console.print("[dim]thinking ...[/dim]")
+    try:
+        reply = generate(
+            prompt={
+                "system": SETTINGS_QA_SYSTEM,
+                "user": SETTINGS_QA_TEMPLATE.format(proposals=rendered, question=question),
+            },
+            cfg=cfg,
+            stage="feedback",
+        ).strip()
+    except Exception as e:
+        logger.warning(f"Could not answer the settings question: {e}")
+        reply = "I could not answer that. Pick numbers to apply, /go for all, or /keep for none."
+    console.print(Panel(reply, border_style="cyan", expand=False))
+
+
 def review_settings_for_plan(cfg, plan: str, console: Console) -> list[tuple[str, str]]:
     """Show plan-derived setting recommendations and apply what the user accepts.
 
@@ -412,28 +454,41 @@ def review_settings_for_plan(cfg, plan: str, console: Console) -> list[tuple[str
               border_style="yellow", expand=False)
     )
 
-    console.print(
-        "\n  [dim]'a' = apply all (recommended) · 'k' = keep everything as-is · "
-        "or list the numbers to apply, e.g. '1 3'[/dim]"
+    from agents.prompt_commands import (
+        ask_command, is_selection, render_help, selected_indices,
     )
-    try:
-        from agents.plan_mode import chat_prompt
 
-        reply = chat_prompt(
-            console,
-            hint="'a' apply all · 'k' keep all · or list numbers like '1 3'",
-            default="a",
-        ).lower()
-    except (EOFError, KeyboardInterrupt):
-        reply = "k"
+    chosen = None
+    while chosen is None:
+        try:
+            command = ask_command(
+                console,
+                hint="/go apply all · /keep keep all · numbers like '1 3' · /ask a question · /back",
+                default="",
+            )
+        except (EOFError, KeyboardInterrupt):
+            chosen = []
+            break
 
-    if reply in {"k", "keep", "n", "no"}:
-        chosen = []
-    elif reply in {"a", "all", "y", "yes", ""}:
-        chosen = proposals
-    else:
-        picked = {int(t) for t in reply.replace(",", " ").split() if t.isdigit()}
-        chosen = [p for i, p in enumerate(proposals, 1) if i in picked]
+        if command.kind in {"go", "empty"}:
+            chosen = proposals
+        elif command.kind in {"keep", "quit"}:
+            chosen = []
+        elif command.kind == "back":
+            return None  # caller reruns the previous step
+        elif command.kind == "raw" and is_selection(command.text):
+            picked = selected_indices(command.text)
+            unknown = picked - set(range(1, len(proposals) + 1))
+            if unknown:
+                console.print(f"  [yellow]No such row: {sorted(unknown)}[/yellow]")
+                continue
+            chosen = [p for i, p in enumerate(proposals, 1) if i in picked]
+        elif command.kind in {"ask", "raw", "change"}:
+            # Prose. Never scrape it for digits and never fall through to a
+            # default action — answer it, then ask again.
+            answer_settings_question(cfg, command.text, proposals, console)
+        else:
+            render_help(console)
 
     notes = []
     for p in proposals:

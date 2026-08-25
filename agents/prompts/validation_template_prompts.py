@@ -17,7 +17,8 @@ def get_code_review_prompt(task_desc: str, code: str) -> Dict[str, Any]:
         "⚠️ **CRITICAL INSTRUCTION**:\n"
         "You must strictly follow the [Code Review Guidelines] provided below.\n"
         "Do NOT rely on your general knowledge if it conflicts with the Environment Facts listed in the guidelines.\n"
-        "Your output must be a structured review focusing ONLY on Data Leakage and Critical Integrity."
+        "Your output must be a structured review focusing on Data Leakage and Critical Integrity first, "
+        "and then on whether a human could actually read this code before running it."
         "**STRICTLY FORBIDDEN**: Do NOT replace the user's model architecture with other backbones (e.g., ResNet, VGG) just to make code executable. Do not question or change the user's model choice.\n"
     )
     prompt = {
@@ -93,16 +94,41 @@ def get_code_review_guidelines() -> list:
         "  • NO tqdm, NO verbose=1 in training",
         "",
         "---\n",
+        "## 🟢 P2 - Readability (a human reviews this code before it runs)\n",
+        "",
+        "### P2.1 Duplication",
+        "  • The same metric/plot/fit block copy-pasted per fold, per threshold, or per model?",
+        "  • Several near-identical blocks that should be one loop over a list?",
+        "  • → Factor into one small named function and call it. Behaviour must stay identical.",
+        "",
+        "### P2.2 Oversized definitions",
+        "  • A single function doing loading + training + evaluation + plotting?",
+        "  • Deeply nested or heavily branched definitions that cannot be read in one pass?",
+        "  • → Split by responsibility. Keep each function short and single-purpose.",
+        "",
+        "### P2.3 Needless structure",
+        "  • Classes, decorators or config layers where a plain function would do? → Simplify.",
+        "",
+        "⚠️ **Limits on P2 fixes** (violating these is worse than the duplication):",
+        "  • NEVER change behaviour, numbers, model choice, or the validation protocol.",
+        "  • NEVER remove a required output: `./submission/submission.csv`, the metrics files,"
+        " the plots, or the final `Final Validation Score` print.",
+        "  • Short but complete beats short and missing pieces. If unsure, leave it alone.",
+        "  • Cosmetic preferences (naming, spacing, import order, comments) are NOT worth a revision.",
+        "",
+        "---\n",
         "## 📋 Decision Rule\n",
         "",
         "**needs_revision=True** ONLY IF:",
         "  • P0 data leakage found (MUST FIX)",
         "  • OR P1 critical bug found",
+        "  • OR P2 duplication is SUBSTANTIAL — the same logic repeated three or more times,"
+        " or one function longer than roughly 100 lines",
         "",
         "**needs_revision=False** IF:",
-        "  • No P0/P1 bugs found",
+        "  • No P0/P1 bugs, and the code is already readable in one pass",
         "",
-        "**Default**: Approve unless concrete logic bugs found"
+        "**Default**: Approve unless concrete logic bugs, or duplication a reader would trip over"
     ]
     return guidelines
 

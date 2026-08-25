@@ -169,7 +169,7 @@ def select_with_soft_switch(agent) -> SearchNode:
         logger.info("📊 Search not started yet, using standard UCT")
         return select(agent, agent.virtual_root)
 
-    time_elapsed = time.time() - agent.search_start_time
+    time_elapsed = agent.elapsed(agent.search_start_time)
     total_time = agent.acfg.time_limit
     time_progress = time_elapsed / total_time
 
