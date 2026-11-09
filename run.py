@@ -19,8 +19,11 @@ from utils.logging_config import setup_logging
 from utils.run_paths import print_output_paths, run_root, to_windows_path
 from utils.export_notebook import export_notebook
 from utils.data_preview import clean_task_desc
+from utils import monitor
+from agents.prompts.framing import framing_of
 from agents.plan_mode import run_plan_gate
 from agents.setup_agent import needs_setup, run_setup
+from agents.eda_agent import run_eda_gate, build_context_block
 from agents.main_agent import ControlBus, MainAgent, render_status
 from agents.draft_review import review_draft, ACCEPT, REJECT, ABORT
 from rich.console import Console
@@ -39,6 +42,7 @@ def run():
         torch.hub.set_dir(cfg.torch_hub_dir)
     set_global_seed(cfg.agent.seed)
     logger = setup_logging(cfg)
+    monitor.run_started(cfg)
     logger.info(f'Starting run "{cfg.exp_name}"')
 
     task_desc = load_task_desc(cfg)
@@ -52,6 +56,25 @@ def run():
         prep_agent_workspace(cfg)
 
     print_output_paths(cfg)
+
+    # EDA gate. Runs first so the plan that follows is grounded in measured
+    # facts rather than assumptions, and so the confirmed data plan reaches
+    # every agent through the task description.
+    eda_block = ""
+    if cfg.eda.enabled:
+        from utils.data_preview import generate as preview_data
+
+        try:
+            preview = preview_data(str(cfg.workspace_dir), framing=framing_of(cfg))
+        except Exception as e:
+            logger.warning(f"Data preview failed before EDA: {e}")
+            preview = ""
+        result = run_eda_gate(cfg, task_desc, preview)
+        if result is None and sys.stdin.isatty() and cfg.eda.enabled:
+            logger.info("No EDA report; continuing without one.")
+        elif result:
+            report_path, data_plan = result
+            eda_block = build_context_block(report_path, data_plan)
 
     # Plan gate. Runs after the workspace exists (clean_task_desc reads
     # input/ for a sample submission) and before anything is spent on search.
@@ -68,6 +91,19 @@ def run():
             logger.info("Exiting at the plan gate; nothing was executed.")
             return
         cleaned_task_desc = approved_task_desc
+        task_desc_is_clean = True
+
+    # The confirmed data plan rides along with the task description, so the
+    # data_processing_and_feature_engineering step works from it.
+    if eda_block:
+        from agents.plan_mode import _as_text
+
+        cleaned_task_desc = _as_text(cleaned_task_desc) + eda_block
+        task_desc_is_clean = True
+
+    # Started from the dashboard: the EDA and plan steps already ran there, and
+    # desc_file holds the approved, already cleaned task description.
+    if getattr(cfg.plan_mode, "preapproved", False):
         task_desc_is_clean = True
 
     global_step = 0
@@ -95,7 +131,14 @@ def run():
 
     def exec_callback(*args, **kwargs):
         status.update("[magenta]Executing code...")
-        res = interpreter.run(*args, **kwargs)
+        node_id = args[1] if len(args) > 1 else kwargs.get("id")
+        t0 = monitor.exec_started(node_id)
+        ok = False
+        try:
+            res = interpreter.run(*args, **kwargs)
+            ok = True
+        finally:
+            monitor.exec_finished(node_id, t0, ok=ok)
         status.update("[green]Generating code...")
         return res
 
@@ -123,7 +166,50 @@ def run():
 
     console = Console()
     bus = ControlBus()
-    MainAgent(cfg, bus, console).start()
+    operator_guidance: list[str] = []
+
+    def run_context() -> dict:
+        """Facts the main agent may use when it answers the operator."""
+        nodes = [n for n in list(journal.nodes) if n.stage != "root"]
+        scored = [n for n in nodes if not n.is_buggy and n.metric is not None and n.metric.value is not None]
+        scored.sort(key=lambda n: n.metric.value, reverse=bool(agent.metric_maximize))
+        plan_head = lambda n: " ".join((n.plan or "").split())[:240]
+        activity = monitor.current_activity()
+        known = {n.id[:8] for n in nodes}
+        for item in activity:  # a draft's calls name the hidden search root
+            if item.get("solution") not in known:
+                item["solution"] = None
+        return {
+            "metric_higher_is_better": agent.metric_maximize,
+            "top_solutions": [{"id": n.id[:8], "stage": n.stage, "score": n.metric.value, "plan": plan_head(n)}
+                              for n in scored[:5]],
+            "recent_failures": [{"id": n.id[:8], "stage": n.stage, "error": n.exc_type, "plan": plan_head(n)}
+                                for n in [n for n in nodes if n.is_buggy][-3:]],
+            "operator_guidance_in_effect": operator_guidance,
+            "solutions_so_far": len(nodes),
+            "in_progress": activity,
+            "time_limit_s": cfg.agent.time_limit,
+        }
+
+    def apply_guidance(text: str) -> None:
+        """Operator guidance from the main agent: appended to the task description every agent reads."""
+        from agents.plan_mode import _as_text
+
+        operator_guidance.append(text)
+        stamp = time.strftime("%H:%M")
+        agent.task_desc = (
+            _as_text(agent.task_desc)
+            + f"\n\n**OPERATOR GUIDANCE (added during the run at {stamp})**\n"
+            + "The task owner added this while the search was running. Follow it in new solutions "
+            + "unless it conflicts with the task's metric or data rules; say so if you deviate.\n"
+            + f"- {text}\n"
+        )
+        logger.info(f"Operator guidance added: {text}")
+
+    # Guidance is applied at once (not between steps), so it also reaches the first drafts.
+    main_agent = MainAgent(cfg, bus, console, context=run_context, on_guidance=apply_guidance)
+    main_agent.start()
+    monitor.start_control_watcher(cfg, bus, chat_handler=main_agent.handle_message)
     agent.control = bus  # lets a queued stop land inside a step, not just between them
 
     def publish_snapshot(completed, total, running):
@@ -255,6 +341,8 @@ def run():
                     if action == "status":
                         publish_snapshot(completed, total_steps, len(futures))
                         render_status(bus, console)
+                    elif action == "guide":
+                        apply_guidance(payload["text"])
                     elif action == "seed":
                         pending_seeds.append(payload["path"])
                         logger.info(f"Operator queued a seed solution: {payload['path']}")
@@ -318,6 +406,7 @@ def run():
         except KeyboardInterrupt:
             interrupted = True
             logger.info("KeyboardInterrupt received, terminating subprocesses and shutting down...")
+            monitor.run_ended("interrupted")
             interpreter.terminate_all_subprocesses()
             executor.shutdown(wait=False, cancel_futures=True) if sys.version_info >= (3, 9) else executor.shutdown(wait=False)
             export_final_notebook()
@@ -336,6 +425,7 @@ def run():
         logger.info(f"✅ All steps completed in Phase 1 (total_steps={total_steps} <= initial_draft_count={initial_draft_count})")
 
     interpreter.cleanup_session(-1)
+    monitor.run_ended("aborted" if bus.abort_requested else "stopped" if bus.stop_requested else "finished")
     export_final_notebook()
     print_output_paths(cfg)
 

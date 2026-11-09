@@ -10,6 +10,7 @@ from utils.response import wrap_code
 from engine.validation import call_validate, _validate_submission_with_retry, validate_submission_content_quality
 from agents import data_leakage_agent
 from agents.triggers import should_check_data_leakage
+from agents.prompts.framing import KAGGLE, framing_of
 
 logger = logging.getLogger("MLEvolve")
 
@@ -61,6 +62,7 @@ def determine_metric_direction(agent) -> None:
 
     Provide clear reasoning based on the evaluation metric specified in the task.
     """
+    prompt = framing_of(agent.cfg).adapt(prompt)
 
     max_retries = 3
     for attempt in range(1, max_retries + 1):
@@ -165,7 +167,7 @@ def _build_introduction(agent) -> str:
             "data preprocessing, feature engineering, model architecture/training, and validation strategy.\n"
         )
     intro += "\nDo NOT omit any field."
-    return intro
+    return framing_of(agent.cfg).adapt(intro)
     
 
 
@@ -195,7 +197,7 @@ def _save_code_summary(agent, node: SearchNode, response: dict):
         node.code_summary = None
 
 
-def _determine_buggy(node: SearchNode, response: dict, has_csv_submission: bool):
+def _determine_buggy(node: SearchNode, response: dict, has_csv_submission: bool, require_submission: bool = True):
     """Decide whether a node failed.
 
     A submission plus a reported metric means the solution reached the end of its
@@ -204,6 +206,8 @@ def _determine_buggy(node: SearchNode, response: dict, has_csv_submission: bool)
     broken plotting call after the submission was already written, for example.
     Such nodes keep their score and carry the error forward so the debug/improve
     agents fix it on the next iteration.
+
+    With require_submission=False the reported metric alone is the result.
     """
     failure_reasons = []
     if response["is_bug"]:
@@ -212,12 +216,12 @@ def _determine_buggy(node: SearchNode, response: dict, has_csv_submission: bool)
         failure_reasons.append(f"exception raised: {node.exc_type}")
     if response["metric"] is None:
         failure_reasons.append("no metric value reported")
-    if not has_csv_submission:
+    if require_submission and not has_csv_submission:
         failure_reasons.append("submission file not found")
 
     # Both artifacts present: the metric is only printed at the end of scoring,
     # and the submission is written from real predictions, so the run got there.
-    produced_results = has_csv_submission and response["metric"] is not None
+    produced_results = (has_csv_submission or not require_submission) and response["metric"] is not None
     node.completed_with_errors = bool(failure_reasons) and produced_results
 
     node.is_buggy = bool(failure_reasons) and not produced_results
@@ -255,6 +259,15 @@ def _grading_exp_id(cfg) -> str:
 def _validate_format_with_retry(agent, node: SearchNode):
     exp_id = _grading_exp_id(agent.cfg)
     submission_path = agent.cfg.workspace_dir / "submission" / f"submission_{node.id}.csv"
+
+    framing = framing_of(agent.cfg)
+    if not framing.require_submission and not submission_path.exists():
+        node.is_valid = True
+        return
+    if framing.profile != KAGGLE:
+        # The format server only knows MLE-Bench competitions.
+        _check_content_quality(agent, node, submission_path)
+        return
 
     status, res = _validate_submission_with_retry(
         exp_id=exp_id,
@@ -465,7 +478,7 @@ def run(agent, node: SearchNode, exec_result: ExecutionResult) -> SearchNode:
 
             node.analysis = response["summary"]
             _save_code_summary(agent, node, response)
-            _determine_buggy(node, response, has_csv_submission)
+            _determine_buggy(node, response, has_csv_submission, framing_of(agent.cfg).require_submission)
 
             if not node.is_buggy:
                 _validate_format_with_retry(agent, node)

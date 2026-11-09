@@ -17,6 +17,7 @@ from agents.prompts import (
     get_impl_guideline_from_agent,
 )
 from agents.planner import build_chat_prompt_for_model
+from agents.prompts.framing import framing_of
 
 logger = logging.getLogger("MLEvolve")
 
@@ -53,7 +54,7 @@ def run(agent, init_solution_path: Optional[str] = None) -> SearchNode:
         "Your solution will be evaluated on a real leaderboard. Treat this with professionalism.\n\n"
     )
 
-    introduction = (
+    introduction = framing_of(agent.cfg).adapt(
         professional_identity +
         "Now, let's begin the competition. "
         "You need to come up with an excellent and creative plan for a competitive solution "

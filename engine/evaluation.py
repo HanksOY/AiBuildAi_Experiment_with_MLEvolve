@@ -27,6 +27,29 @@ def backpropagate(node: SearchNode, value: float, add_to_tree=True):
         node = node.parent
 
 
+# A gain smaller than the metric's own sampling noise is not a gain. Rewarding
+# it makes the search chase favourable splits. Scored in units of this floor:
+# below 1x counts as a tie, and the bonus saturates by SATURATION_SIGMAS so a
+# single lucky outlier cannot dominate the tree.
+MAX_IMPROVEMENT_BONUS = 1.5
+SATURATION_SIGMAS = 5.0
+
+
+def improvement_bonus(improvement: float, noise_floor: float) -> float:
+    """Scale a raw metric gain to [0, MAX_IMPROVEMENT_BONUS].
+
+    Returns 0 for anything inside the noise floor, then rises linearly with
+    effect size and flattens once the gain is clearly real.
+    """
+    if noise_floor <= 0:
+        return MAX_IMPROVEMENT_BONUS if improvement > 0 else 0.0
+    sigmas = improvement / noise_floor
+    if sigmas <= 1.0:
+        return 0.0
+    scaled = (sigmas - 1.0) / (SATURATION_SIGMAS - 1.0)
+    return MAX_IMPROVEMENT_BONUS * min(1.0, scaled)
+
+
 def get_node_reward(agent, node: SearchNode):
     reward = 0
 
@@ -37,9 +60,20 @@ def get_node_reward(agent, node: SearchNode):
     else:
         if node.metric.value is not None and agent.best_metric is not None:
             improvement = node.metric.value - agent.best_metric if node.metric.maximize else agent.best_metric - node.metric.value
-            if improvement > 0:
-                logger.info(f"Node {node.id} is better than the best node {agent.best_node.id} now!")
-                reward += 1.5
+            noise_floor = getattr(agent.scfg, "metric_noise_floor", 0.0)
+            bonus = improvement_bonus(improvement, noise_floor)
+            if bonus > 0:
+                logger.info(
+                    f"Node {node.id} beats the best ({agent.best_metric:.4f} -> "
+                    f"{node.metric.value:.4f}, +{improvement:.4f} = "
+                    f"{improvement / noise_floor:.1f}x noise); bonus {bonus:.2f}"
+                )
+                reward += bonus
+            elif improvement > 0:
+                logger.info(
+                    f"Node {node.id} is nominally better (+{improvement:.4f}) but that is "
+                    f"within the noise floor ({noise_floor}); treating it as a tie."
+                )
 
         if node.parent and node.parent.stage != "root":
             if node.parent.is_buggy is True:

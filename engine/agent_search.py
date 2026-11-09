@@ -8,6 +8,7 @@ from typing import Callable, List, Dict, Optional
 from engine.executor import ExecutionResult
 from engine.search_node import SearchNode, Journal
 import utils.data_preview as data_preview
+from agents.prompts.framing import framing_of
 from config import Config
 from utils.metric import WorstMetricValue
 import threading
@@ -129,7 +130,7 @@ class AgentSearch:
             return str(prompt_complete)
 
     def update_data_preview(self):
-        base_preview = data_preview.generate(self.cfg.workspace_dir)
+        base_preview = data_preview.generate(self.cfg.workspace_dir, framing=framing_of(self.cfg))
         submission_format_warning = """
 
         ⚠️  CRITICAL SUBMISSION FORMAT NOTE:

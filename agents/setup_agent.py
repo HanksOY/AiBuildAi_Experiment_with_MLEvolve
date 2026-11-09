@@ -9,9 +9,13 @@ Only three things genuinely need asking beyond credentials — ``data_dir``,
 ``goal`` and ``eval``. Everything else has a workable default or can be
 detected, and can later be adjusted from the plan gate.
 
+Provider 1, Claude Code, needs no API key: it runs on the user's logged-in
+`claude` CLI (see llm/claude_code.py) and is verified with one `claude -p` call.
+
 Run explicitly:
     python -m agents.setup_agent
-It also triggers automatically from run.py when no API key is configured.
+It also triggers automatically from run.py when no API key is configured and
+the configured models are not Claude Code models.
 """
 
 import logging
@@ -97,7 +101,9 @@ If the settings already fit the plan, reply exactly: {{"recommendations": []}}
 """
 
 # base_url + a sensible default model pair per provider.
+CLAUDE_CODE_PROVIDER = "Claude Code (your Claude subscription, no API key)"
 PROVIDERS = [
+    (CLAUDE_CODE_PROVIDER, "", "claude-code:opus", "claude-code:sonnet"),
     ("GLM / BigModel", "https://open.bigmodel.cn/api/paas/v4", "glm-5.2", "glm-4.5-air"),
     ("OpenAI", "https://api.openai.com/v1", "gpt-5.2", "gpt-5.2-mini"),
     ("DeepSeek", "https://api.deepseek.com", "deepseek-chat", "deepseek-chat"),
@@ -109,6 +115,9 @@ HELP = {
     "model": "The code model writes solutions; the feedback model reads results. "
              "The feedback model can be smaller and cheaper.",
     "api_key": "Written to .env, which is git-ignored. It never goes into config.yaml.",
+    "claude_model": "A Claude model alias (opus, sonnet, haiku) or a full model id such as "
+                    "claude-opus-5-5. Calls go through your logged-in `claude` CLI and count "
+                    "against your subscription's usage limits.",
     "data_dir": "Folder holding your input files. It is copied or symlinked into the "
                 "run workspace as ./input/, which is what generated code reads.",
     "goal": "What to build, plus anything the model cannot infer from the files alone: "
@@ -518,7 +527,8 @@ def choose_provider(console: Console) -> tuple[str, str, str] | None:
     """Returns (base_url, code_model, feedback_model)."""
     table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
     for i, (name, url, code, _fb) in enumerate(PROVIDERS, 1):
-        table.add_row(f"[cyan]{i}.[/cyan]", name, f"[dim]{url or 'native SDK'}[/dim]")
+        where = "local `claude` CLI" if name == CLAUDE_CODE_PROVIDER else (url or "native SDK")
+        table.add_row(f"[cyan]{i}.[/cyan]", name, f"[dim]{where}[/dim]")
     table.add_row(f"[cyan]{len(PROVIDERS) + 1}.[/cyan]", "Other", "[dim]self-hosted or proxy[/dim]")
     console.print(Panel(table, title="[bold]Which API provider?[/bold]", border_style="cyan", expand=False))
 
@@ -527,7 +537,9 @@ def choose_provider(console: Console) -> tuple[str, str, str] | None:
         return None
 
     if choice.isdigit() and 1 <= int(choice) <= len(PROVIDERS):
-        _name, base_url, code, fb = PROVIDERS[int(choice) - 1]
+        name, base_url, code, fb = PROVIDERS[int(choice) - 1]
+        if name == CLAUDE_CODE_PROVIDER:
+            return choose_claude_models(console, code, fb)
     else:
         base_url = choice if choice.startswith("http") else ""
         if not base_url:
@@ -541,6 +553,53 @@ def choose_provider(console: Console) -> tuple[str, str, str] | None:
     if fb_model is None:
         return None
     return base_url, code_model, fb_model
+
+
+CLAUDE_MODELS = [
+    ("opus", "most capable; best for writing solutions"),
+    ("sonnet", "fast and strong; a good fit for reading results"),
+    ("haiku", "fastest and lightest on usage limits"),
+]
+
+
+def choose_claude_models(console: Console, code: str, fb: str) -> tuple[str, str, str] | None:
+    """Pick Claude models for the claude-code backend. Returns (base_url, code_model, feedback_model)."""
+    from llm.claude_code import PREFIX, cli_model
+
+    table = Table(show_header=False, box=None, padding=(0, 2, 0, 0))
+    for alias, note in CLAUDE_MODELS:
+        table.add_row(f"[cyan]{alias}[/cyan]", f"[dim]{note}[/dim]")
+    table.add_row("[cyan]<model id>[/cyan]", "[dim]any full id, e.g. claude-opus-5-5[/dim]")
+    console.print(Panel(table, title="[bold]Which Claude models?[/bold]", border_style="cyan", expand=False))
+
+    code_name = _ask(console, "Code model (writes solutions)", default=cli_model(code), help_text=HELP["claude_model"])
+    if code_name is None:
+        return None
+    fb_name = _ask(console, "Feedback model (reads results)", default=cli_model(fb), help_text=HELP["claude_model"])
+    if fb_name is None:
+        return None
+    as_model = lambda name: f"{PREFIX}:{name.removeprefix(PREFIX + ':')}" if name else PREFIX
+    return "", as_model(code_name), as_model(fb_name)
+
+
+def verify_claude_code(console: Console, model: str) -> bool:
+    """One tiny `claude -p` call, so a missing CLI or login fails here."""
+    from llm import claude_code
+
+    console.print("  [dim]Checking your Claude login with a test request ...[/dim]")
+    try:
+        claude_code.query("Reply with the single word: ok", None, model=model)
+    except FileNotFoundError:
+        console.print(
+            "  [red]The `claude` CLI is not on PATH in this shell.[/red] Install Claude Code "
+            "in the same environment that runs MLEvolve (WSL), then run `claude` once to log in."
+        )
+        return False
+    except Exception as e:
+        console.print(f"  [red]Failed:[/red] {str(e)[:220]}\n  [dim]Run `claude` once to log in, then try again.[/dim]")
+        return False
+    console.print("  [green]Claude login works.[/green]")
+    return True
 
 
 def verify_key(console: Console, base_url: str, model: str, api_key: str) -> bool:
@@ -583,6 +642,15 @@ def collect_credentials(console: Console) -> dict | None:
             return None
         base_url, code_model, fb_model = chosen
 
+        if uses_claude_code(code_model, fb_model):
+            if verify_claude_code(console, code_model):
+                creds = {"base_url": base_url, "code_model": code_model, "feedback_model": fb_model, "api_key": ""}
+                creds.update(collect_compute(console))
+                return creds
+            if not Confirm.ask("  Try again?", default=True, console=console):
+                return None
+            continue
+
         api_key = _ask(console, "API key", default="", help_text=HELP["api_key"])
         if api_key is None:
             continue
@@ -590,7 +658,14 @@ def collect_credentials(console: Console) -> dict | None:
             console.print("  [red]A key is required.[/red]")
             continue
 
-        if verify_key(console, base_url, code_model, api_key):
+        # A mixed pair (one stage on Claude Code) still needs a key for the other stage.
+        from llm.claude_code import is_claude_code
+
+        api_model = fb_model if is_claude_code(code_model) else code_model
+        cc_model = next((m for m in (code_model, fb_model) if is_claude_code(m)), None)
+        if verify_key(console, base_url, api_model, api_key) and (
+            cc_model is None or verify_claude_code(console, cc_model)
+        ):
             creds = {
                 "base_url": base_url,
                 "code_model": code_model,
@@ -817,8 +892,28 @@ def write_config(creds: dict, data_dir: str, goal: str, evaluation: str, compute
     return backup
 
 
+def uses_claude_code(*models: str) -> bool:
+    """True when every given model runs on the Claude Code CLI, so no API key is needed."""
+    from llm.claude_code import is_claude_code
+
+    return bool(models) and all(is_claude_code(m) for m in models)
+
+
+def _configured_models() -> tuple[str, str]:
+    """agent.code.model / agent.feedback.model from config.yaml plus CLI overrides."""
+    from omegaconf import OmegaConf
+
+    try:
+        cfg = OmegaConf.merge(OmegaConf.load(CONFIG_PATH), OmegaConf.from_cli())
+        return str(cfg.agent.code.model), str(cfg.agent.feedback.model)
+    except Exception:
+        return "", ""
+
+
 def needs_setup() -> bool:
-    """True when no API key is reachable, i.e. this looks like a first run."""
+    """True when no model connection is reachable, i.e. this looks like a first run."""
+    if uses_claude_code(*_configured_models()):
+        return False
     if os.environ.get("MLEVOLVE_CODE_API_KEY"):
         return False
     if not ENV_PATH.exists():
@@ -834,7 +929,7 @@ def run_setup() -> bool:
     console = Console()
     console.print(
         Panel(
-            "No API key found, so this looks like a first run.\n\n"
+            "No model connection is configured, so this looks like a first run.\n\n"
             "I'll get your model connection working, then read your data and draft the task "
             "description for you. Four steps.\n\n"
             "[dim]At any prompt: type freely, '?' for help, 'back' to go back, Ctrl+C to quit.[/dim]",
@@ -875,11 +970,13 @@ def run_setup() -> bool:
         console.print("\n[yellow]Setup cancelled. Nothing was written.[/yellow]")
         return False
 
-    write_env(creds)
+    written = []
+    # Claude Code needs no key: leave any existing .env untouched.
+    if creds["api_key"]:
+        write_env(creds)
+        written.append(f"[green]✓[/green] {ENV_PATH}  [dim](your API key, git-ignored)[/dim]")
     backup = write_config(creds, data_dir, goal, evaluation, creds)
-
-    written = [f"[green]✓[/green] {ENV_PATH}  [dim](your API key, git-ignored)[/dim]",
-               f"[green]✓[/green] {CONFIG_PATH}"]
+    written.append(f"[green]✓[/green] {CONFIG_PATH}")
     if backup:
         written.append(f"[dim]  previous config saved to {backup.name}[/dim]")
     console.print(

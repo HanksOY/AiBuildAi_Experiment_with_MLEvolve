@@ -4,6 +4,7 @@ import logging
 
 from engine.search_node import SearchNode
 from utils.metric import WorstMetricValue
+from agents.prompts.framing import framing_of
 
 logger = logging.getLogger("MLEvolve")
 
@@ -24,7 +25,7 @@ def validate_executed_node(agent, node: SearchNode):
         return
 
     submission_path = agent.cfg.workspace_dir / "submission" / f"submission_{node.id}.csv"
-    if not submission_path.exists():
+    if framing_of(agent.cfg).require_submission and not submission_path.exists():
         node.is_buggy = True
         node.metric = WorstMetricValue()
         logger.info(f"Node {node.id} did not produce a submission.csv")

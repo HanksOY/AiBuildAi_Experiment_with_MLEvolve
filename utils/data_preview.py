@@ -12,6 +12,8 @@ import pandas as pd
 from genson import SchemaBuilder
 from pandas.api.types import is_numeric_dtype
 
+from agents.prompts.framing import UPSTREAM, Framing, framing_of
+
 # these files are treated as code (e.g. markdown wrapped)
 code_files = {".py", ".sh", ".yaml", ".yml", ".md", ".html", ".xml", ".log", ".rst"}
 # we treat these files as text (rather than binary) files
@@ -149,7 +151,7 @@ def preview_json(p: Path, file_name: str):
     )
 
 
-def generate(base_path, include_file_details=True, simple=False):
+def generate(base_path, include_file_details=True, simple=False, framing: Framing = UPSTREAM):
     """Generate a textual preview of a directory (structure + file previews)."""
     tree = f"```\n{file_tree(base_path)}```"
     out = [tree]
@@ -230,14 +232,14 @@ def generate(base_path, include_file_details=True, simple=False):
                 "**Note**: If existing code already implements this strategy, i will skip this step.\n"
             )
             
-            out.append("\n".join(msg))
+            out.append(framing.adapt("\n".join(msg)))
             
     result = "\n\n".join(out)
 
     # if the result is very long we generate a simpler version
     if len(result) > 6_000 and not simple:
         return generate(
-            base_path, include_file_details=include_file_details, simple=True
+            base_path, include_file_details=include_file_details, simple=True, framing=framing
         )
     # if still too long, we truncate
     if len(result) > 6_000 and simple:
@@ -254,6 +256,7 @@ def clean_task_desc(task_desc: str, cfg) -> str:
     from llm import query, compile_prompt_to_md
 
     acfg = cfg.agent
+    framing = framing_of(cfg)
     alignment_rule = (
         "\n\n"
         + "=" * 60 + "\n"
@@ -331,6 +334,6 @@ def clean_task_desc(task_desc: str, cfg) -> str:
             except Exception as e:
                 logger.warning(f"Failed to read {sample_path}: {e}")
                 continue
-    cleaned_desc += alignment_rule
+    cleaned_desc += framing.adapt(alignment_rule)
     logger.info(f"Generating Task desc: \n  {cleaned_desc} \n")
     return cleaned_desc

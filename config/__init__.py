@@ -38,6 +38,8 @@ class StageConfig:
     # this budget is shared with the reasoning tokens, so a limit that is too low
     # truncates the visible answer mid-token and breaks code extraction.
     max_tokens: int = 16384
+    # Only read by the claude-code backend (`claude --effort`): low..max.
+    effort: str | None = None
 
 @dataclass
 class DecayConfig:
@@ -81,6 +83,10 @@ class SearchConfig:
     fusion_min_successful_nodes: int
     fusion_min_branches: int
     use_stagnation_detection: bool = True
+    # Sampling noise of the ranking metric; gains below it count as ties.
+    metric_noise_floor: float = 0.0
+    # Blend between mean backup (0.0, original) and max backup (1.0) in UCT.
+    max_backup_weight: float = 0.0
 
 @dataclass
 class AgentConfig:
@@ -126,11 +132,42 @@ class InitSolutionConfig:
 
 
 @dataclass
+class EDAConfig:
+    # Run an analysis against the real data, confirm it, and derive a data plan
+    # before anything is planned or trained. Needs a terminal.
+    enabled: bool = True
+    timeout: int = 900
+    max_attempts: int = 2
+
+
+@dataclass
 class DraftReviewConfig:
     # Pause after each initial draft is written, before it runs.
     enabled: bool = True
     # Cap on regenerations per draft slot, so a rejection loop cannot run forever.
     max_regenerations: int = 2
+    # terminal: ask on stdin. file: answers come from the dashboard
+    # (logs/draft_review_answers.jsonl).
+    channel: str = "terminal"
+
+
+@dataclass
+class TaskConfig:
+    # kaggle keeps upstream prompt wording; generic drops the Kaggle framing.
+    profile: str = "kaggle"
+    # False: a node succeeds on its printed validation score alone.
+    require_submission: bool = True
+
+
+@dataclass
+class MonitorConfig:
+    # Recording for the dashboard (python -m dashboard.server). Writes extra
+    # files under logs/ and workspace/node_outputs/; never changes the search.
+    enabled: bool = True
+    record_llm_calls: bool = True
+    snapshot_outputs: bool = True
+    # Accept stop/abort requests from the dashboard via logs/control_requests.jsonl.
+    control: bool = True
 
 
 @dataclass
@@ -139,6 +176,9 @@ class PlanModeConfig:
     # Unattended callers must opt out explicitly (see run_single_task.sh).
     require_confirmation: bool = True
     show_task_diff: bool = True
+    # True: desc_file is the task description already cleaned and approved in
+    # the dashboard, so the run does not clean it again.
+    preapproved: bool = False
 
 
 @dataclass
@@ -172,8 +212,11 @@ class Config(Hashable):
 
     use_grading_server: bool = True
     init_solution: InitSolutionConfig = field(default_factory=InitSolutionConfig)
+    task: TaskConfig = field(default_factory=TaskConfig)
     plan_mode: PlanModeConfig = field(default_factory=PlanModeConfig)
     draft_review: DraftReviewConfig = field(default_factory=DraftReviewConfig)
+    eda: EDAConfig = field(default_factory=EDAConfig)
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)
 
 
 def _get_next_logindex(dir: Path) -> int:
@@ -259,6 +302,15 @@ def prep_cfg(cfg: Config):
     # validate the config
     cfg_schema: Config = OmegaConf.structured(Config)
     cfg = OmegaConf.merge(cfg_schema, cfg)
+
+    # Fail here, not after the interactive EDA and plan gates have run.
+    from agents.prompts.framing import PROFILES
+
+    if cfg.task.profile not in PROFILES:
+        raise ValueError(
+            f"task.profile must be one of {PROFILES}, got {cfg.task.profile!r}. "
+            "Check the command line for a typo or stray punctuation."
+        )
 
     return cast(Config, cfg)
 

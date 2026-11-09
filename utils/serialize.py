@@ -1,5 +1,6 @@
 import copy
 import json
+import time
 from pathlib import Path
 from typing import Type, TypeVar
 
@@ -52,7 +53,24 @@ def dump_json(obj: dataclasses_json.DataClassJsonMixin, path: Path):
     data = dumps_json(obj)
     with open(tmp_path, "w") as f:
         f.write(data)
-    tmp_path.replace(path)
+    _replace_with_retry(tmp_path, path)
+
+
+REPLACE_TRIES = 10
+REPLACE_WAIT_S = 0.2
+
+
+def _replace_with_retry(tmp_path: Path, path: Path):
+    """Rename tmp over path. On a Windows drive (/mnt/*), the rename fails while a Windows program
+    (the dashboard, a virus scanner) has `path` open, so try again for about 2 s."""
+    for attempt in range(REPLACE_TRIES):
+        try:
+            tmp_path.replace(path)
+            return
+        except PermissionError:
+            if attempt == REPLACE_TRIES - 1:
+                raise
+            time.sleep(REPLACE_WAIT_S)
 
 
 G = TypeVar("G", bound=dataclasses_json.DataClassJsonMixin)

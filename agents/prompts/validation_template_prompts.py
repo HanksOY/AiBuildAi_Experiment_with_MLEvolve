@@ -6,11 +6,12 @@ Prompt templates for code review in search pipeline.
 
 from typing import Dict, Any
 from utils.response import wrap_code
+from agents.prompts.framing import UPSTREAM, Framing
 
 # ============================================================================
 # Code Review Prompts
 # ============================================================================
-def get_code_review_prompt(task_desc: str, code: str) -> Dict[str, Any]:
+def get_code_review_prompt(task_desc: str, code: str, framing: Framing = UPSTREAM) -> Dict[str, Any]:
     """Build full code review prompt dict from task description and code."""
     introduction = (
         "You are a Senior Data Science Code Reviewer. Your goal is to ensure the submission is legally valid and logically sound.\n\n"
@@ -27,11 +28,11 @@ def get_code_review_prompt(task_desc: str, code: str) -> Dict[str, Any]:
         "Code to review": wrap_code(code),
         "Instructions": {},
     }
-    prompt["Instructions"]["Code review guidelines"] = get_code_review_guidelines()
+    prompt["Instructions"]["Code review guidelines"] = get_code_review_guidelines(framing)
     prompt["Instructions"]["Response format"] = get_code_review_response_format()
     return prompt
 
-def get_code_review_guidelines() -> list:
+def get_code_review_guidelines(framing: Framing = UPSTREAM) -> list:
     """Code review guidelines."""
     guidelines = [
         "# 📜 Code Review Guidelines\n",
@@ -130,7 +131,7 @@ def get_code_review_guidelines() -> list:
         "",
         "**Default**: Approve unless concrete logic bugs, or duplication a reader would trip over"
     ]
-    return guidelines
+    return framing.adapt_lines(guidelines)
 
 
 def get_code_review_response_format() -> list:

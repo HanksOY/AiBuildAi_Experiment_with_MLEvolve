@@ -4,6 +4,8 @@ import time
 
 import humanize
 
+from agents.prompts.framing import UPSTREAM, Framing, framing_of
+
 
 def get_impl_guideline_from_agent(agent):
     """Build implementation guideline from agent config."""
@@ -16,6 +18,7 @@ def get_impl_guideline_from_agent(agent):
         expose_prediction=getattr(agent.acfg, "expose_prediction", False),
         k_fold_validation=getattr(agent.acfg, "k_fold_validation", 0),
         pretrain_model_dir=getattr(agent.cfg, "pretrain_model_dir", ""),
+        framing=framing_of(agent.cfg),
     )
 
 
@@ -31,6 +34,7 @@ def get_impl_guideline(
     expose_prediction: bool = False,
     k_fold_validation: int = 0,
     pretrain_model_dir: str = "",
+    framing: Framing = UPSTREAM,
 ) -> dict:
     """Build implementation guideline from time and config."""
     impl_guideline = [
@@ -133,4 +137,4 @@ def get_impl_guideline(
             f"The evaluation should be based on {k_fold_validation}-fold cross-validation but only if that's an appropriate evaluation for the task at hand."
         )
 
-    return {"Implementation guideline": impl_guideline}
+    return {"Implementation guideline": framing.adapt_lines(impl_guideline)}

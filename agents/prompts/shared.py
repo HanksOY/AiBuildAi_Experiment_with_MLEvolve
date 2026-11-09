@@ -1,5 +1,7 @@
 """Static shared prompt fragments."""
 
+from agents.prompts.framing import UPSTREAM, Framing
+
 ROBUSTNESS_GENERALIZATION_STRATEGY = {
     "💡 Recommendation: Robustness & Generalization Strategy": [
         "",
@@ -48,7 +50,7 @@ def prompt_resp_fmt():
     }
 
 
-def get_internet_clarification(pretrain_model_dir: str = ""):
+def get_internet_clarification(pretrain_model_dir: str = "", framing: Framing = UPSTREAM):
     """Internet access clarification for improve/debug stages."""
     lines = [
         "**⚠️ IMPORTANT: Internet Access During Code Development**",
@@ -62,4 +64,4 @@ def get_internet_clarification(pretrain_model_dir: str = ""):
     lines.append(
         "- **Do NOT question internet access concerns - all standard ML libraries and pretrained models are available during development."
     )
-    return lines
+    return framing.adapt_lines(lines)

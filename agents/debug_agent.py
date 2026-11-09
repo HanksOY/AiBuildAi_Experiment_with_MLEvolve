@@ -14,6 +14,7 @@ from agents.prompts import (
 from agents.coder.diff_coder import SearchReplacePatcher, DIFF_SYS_FORMAT
 from agents.planner import build_chat_prompt_for_model
 from agents.triggers import register_node
+from agents.prompts.framing import framing_of
 
 logger = logging.getLogger("MLEvolve")
 
@@ -57,6 +58,7 @@ def _format_debug_memory_guidance(agent, similar_fixes: List[Tuple]) -> str:
 
 
 def run(agent, parent_node: SearchNode) -> SearchNode:
+    framing = framing_of(agent.cfg)
     debugging_standards = (
         "🔧 Debug SYSTEMATICALLY: Read error → Identify root cause → Apply minimal, targeted fix.\n\n"
         "**Do**: Fix root cause, preserve solution intent, maintain code quality.\n"
@@ -111,7 +113,7 @@ def run(agent, parent_node: SearchNode) -> SearchNode:
     prompt["Instructions"] |= get_impl_guideline_from_agent(agent)
     prompt["Instructions"] |= ROBUSTNESS_GENERALIZATION_STRATEGY
 
-    internet_clarification = get_internet_clarification(getattr(agent.cfg, "pretrain_model_dir", ""))
+    internet_clarification = get_internet_clarification(getattr(agent.cfg, "pretrain_model_dir", ""), framing)
     prompt["Instructions"]["Implementation guideline"].extend(internet_clarification)
 
     debug_memory_guidance = ""
@@ -147,7 +149,7 @@ def run(agent, parent_node: SearchNode) -> SearchNode:
     base_instructions += compile_prompt_to_md(prompt["Instructions"], 2)
 
     def build_prompt_complete(instructions_with_format, use_full_code_requirement=False):
-        current_introduction = introduction_base + (full_code_requirement if use_full_code_requirement else "")
+        current_introduction = introduction_base + (framing.adapt(full_code_requirement) if use_full_code_requirement else "")
         user_prompt = f"\n# Task description\n{prompt['Task description']}\n{instructions_with_format}"
         assistant_prefix = f"Let me approach this systematically.\nFirst, I'll review the dataset:\n{agent.data_preview}\nThe code that needs fixing:\n{prompt['Previous (buggy) implementation']}\nThe error/issue encountered:\n{prompt['Execution output']}\nAnalyzing the root cause: {parent_node.analysis}\nI'll now fix this issue."
         return build_chat_prompt_for_model(agent.acfg.code.model, current_introduction, user_prompt, assistant_prefix)

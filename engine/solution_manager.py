@@ -6,6 +6,7 @@ from collections import defaultdict
 from typing import List
 
 from engine.search_node import SearchNode
+from agents.prompts.framing import framing_of
 
 logger = logging.getLogger("MLEvolve")
 
@@ -66,10 +67,12 @@ def save_best_solution(agent, result_node, submission_file_path) -> None:
         best_solution_dir.mkdir(exist_ok=True, parents=True)
         best_submission_dir.mkdir(exist_ok=True, parents=True)
 
-        shutil.copy(
-            submission_file_path,
-            best_submission_dir / "submission.csv",
-        )
+        # Without task.require_submission a node can win on its score alone.
+        if framing_of(agent.cfg).require_submission or submission_file_path.exists():
+            shutil.copy(
+                submission_file_path,
+                best_submission_dir / "submission.csv",
+            )
 
         with open(best_solution_dir / "solution.py", "w") as f:
             f.write(result_node.code)
@@ -232,6 +235,10 @@ def update_best_solution(agent, node):
     if agent.best_node is None or agent.best_node.metric < node.metric:
         if agent.best_node is None or node.is_valid is True:
             agent.best_node = node
+            # get_node_reward reads agent.best_metric to score improvement. It was
+            # never assigned, so that whole branch was dead and the reward carried
+            # no information about solution quality.
+            agent.best_metric = node.metric.value
             save_best_solution(agent, node, submission_file_path)
             logger.info(f"[best] updated: node {node.id}, metric={node.metric.value}")
         else:
@@ -239,6 +246,10 @@ def update_best_solution(agent, node):
     else:
         if agent.best_node.is_valid is False:
             agent.best_node = node
+            # get_node_reward reads agent.best_metric to score improvement. It was
+            # never assigned, so that whole branch was dead and the reward carried
+            # no information about solution quality.
+            agent.best_metric = node.metric.value
             save_best_solution(agent, node, submission_file_path)
             logger.info(f"[best] updated: node {node.id}, metric={node.metric.value}")
         else:

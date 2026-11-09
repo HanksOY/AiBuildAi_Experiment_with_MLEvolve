@@ -34,6 +34,7 @@ logger = logging.getLogger("MLEvolve")
 
 HELP_TEXT = """[bold]Commands[/bold]
   [cyan]status[/cyan]        progress, best score so far, what is running
+  [cyan]guide <text>[/cyan]  tell the agents what to try or avoid in later steps
   [cyan]seed <path>[/cyan]   start a new draft from a .py file you edited
   [cyan]stop[/cyan]          finish the running steps, save, then exit
   [cyan]abort[/cyan]         kill running training now, then exit
@@ -41,9 +42,20 @@ HELP_TEXT = """[bold]Commands[/bold]
 
 Anything else is read as a question or an instruction."""
 
+# Same list without terminal markup, for the dashboard chat.
+HELP_PLAIN = (
+    "Commands:\n"
+    "- `status`: progress, best score so far, what is running\n"
+    "- `guide <text>`: tell the agents what to try or avoid in later steps\n"
+    "- `seed <path>`: start a new draft from a .py file you edited\n"
+    "- `stop`: finish the running steps, save, then exit\n"
+    "- `abort`: kill running training now, then exit\n\n"
+    "Anything else is read as a question or an instruction."
+)
+
 INTERPRET_SYSTEM = (
     "You are the operator interface for a long running machine learning search. "
-    "You answer briefly from the run snapshot, or map a request onto a command."
+    "You answer from the run snapshot, or map a request onto a command."
 )
 
 INTERPRET_TEMPLATE = """The operator typed something into a running search. Decide what it means.
@@ -51,17 +63,24 @@ INTERPRET_TEMPLATE = """The operator typed something into a running search. Deci
 Reply with JSON only:
 
 {{
-  "action": "status" | "stop" | "abort" | "seed" | "reply",
+  "action": "status" | "stop" | "abort" | "seed" | "guide" | "reply",
   "path": "file path, only when action is seed",
-  "reply": "what to tell the operator, one or two sentences"
+  "guidance": "only when action is guide: the instruction for the agents, in the operator's words",
+  "reply": "what to tell the operator, at most a short paragraph; Markdown allowed"
 }}
 
 Use "reply" for questions you can answer from the snapshot, and for anything you are
-unsure about — never guess a destructive action. Only choose "stop" or "abort" when the
+unsure about. Never guess a destructive action. Only choose "stop" or "abort" when the
 operator clearly asks to end the run; "abort" only when they want it stopped immediately.
+Choose "guide" when the operator tells the agents what to try, prefer, change or avoid in
+later solutions (for example "try XGBoost" or "do not use SMOTE"). Guidance reaches the
+steps that start after it is added; steps already running do not see it.
 
 # Run snapshot
 {snapshot}
+
+# Recent conversation
+{history}
 
 # What the operator typed
 {message}
@@ -121,20 +140,34 @@ class ControlBus:
 
 
 class MainAgent:
-    """Reads operator input on a background thread and queues actions for the loop."""
+    """Turns operator messages, typed in the terminal or sent from the dashboard, into actions.
 
-    def __init__(self, cfg, bus: ControlBus, console: Console | None = None):
+    Replies go to the terminal and, when dashboard recording is on, to
+    logs/chat.jsonl, so both places show the same conversation.
+    """
+
+    def __init__(self, cfg, bus: ControlBus, console: Console | None = None, context=None, on_guidance=None):
         self.cfg = cfg
         self.bus = bus
         self.console = console or Console()
+        # Optional callable returning extra run facts (solutions, failures, guidance).
+        self.context = context
+        # Optional callable(text) that applies guidance at once. Without it guidance
+        # is queued on the bus and applied between steps.
+        self.on_guidance = on_guidance
         self._thread: threading.Thread | None = None
+        self._history: list[tuple[str, str]] = []
+        self._history_lock = threading.Lock()
 
     # -- lifecycle ------------------------------------------------------------
 
     def start(self) -> bool:
-        """Start the reader. Returns False when there is no terminal to read from."""
+        """Start the terminal reader. Returns False when there is no terminal to read from.
+
+        Dashboard messages do not need this: they arrive through handle_message().
+        """
         if not sys.stdin.isatty():
-            logger.info("Main agent disabled: stdin is not a terminal.")
+            logger.info("Main agent terminal input disabled: stdin is not a terminal.")
             return False
 
         self.console.print(
@@ -160,64 +193,148 @@ class MainAgent:
                 return
             line = line.strip()
             if line:
-                try:
-                    self._handle(line)
-                except Exception as e:
-                    logger.warning(f"Main agent could not handle input {line!r}: {e}")
-                    self.console.print(f"[red]Could not handle that: {e}[/red]")
+                self.handle_message(line)
+
+    # -- output ---------------------------------------------------------------
+
+    def _say(self, text: str, kind: str = "reply", reply_to=None, style: str = "cyan") -> None:
+        """Show a reply in the terminal and in the dashboard chat."""
+        from utils import monitor
+
+        if kind == "reply":
+            self.console.print(Panel(text, border_style=style, expand=False))
+        else:
+            self.console.print(f"[{style}]{text}[/{style}]")
+        monitor.chat_message("agent", text, kind=kind, reply_to=reply_to)
+        with self._history_lock:
+            self._history.append(("agent", text))
+            del self._history[:-12]
 
     # -- input handling -------------------------------------------------------
 
-    def _handle(self, line: str) -> None:
+    def handle_message(self, line: str, msg_id=None) -> None:
+        """Entry point for one operator message. Never raises.
+
+        msg_id is set for dashboard messages, which the dashboard already shows;
+        terminal input is copied into the chat log so both places match.
+        """
+        if msg_id is None:
+            from utils import monitor
+
+            monitor.chat_message("operator", line, kind="terminal")
+        with self._history_lock:
+            self._history.append(("operator", line))
+            del self._history[:-12]
+        try:
+            self._handle(line, msg_id)
+        except Exception as e:
+            logger.warning(f"Main agent could not handle input {line!r}: {e}")
+            self._say(f"Could not handle that: {e}", kind="error", reply_to=msg_id, style="red")
+
+    def _handle(self, line: str, msg_id=None) -> None:
         word, _, rest = line.partition(" ")
-        command, rest = word.lower(), rest.strip()
+        command, rest = word.lower().lstrip("/"), rest.strip()
 
         if command in {"help", "?", "h"}:
-            self.console.print(Panel(HELP_TEXT, border_style="cyan", expand=False))
+            self._say(HELP_PLAIN, reply_to=msg_id)
             return
         if command in {"status", "st"}:
-            self.bus.push("status")
+            self._say(self.status_text(), reply_to=msg_id)
             return
         if command in {"stop", "quit", "exit"}:
-            self.console.print("[yellow]Stopping after the running steps finish ...[/yellow]")
-            self.bus.request_stop()
-            self.bus.push("stop")
+            self._request("stop", "Stopping after the running steps finish.", msg_id)
             return
         if command in {"abort", "kill"}:
-            self.console.print("[red]Aborting: killing running training now ...[/red]")
-            self.bus.request_abort()
-            self.bus.push("abort")
+            self._request("abort", "Aborting: killing running training now.", msg_id)
             return
         if command == "seed":
-            self._queue_seed(rest)
+            self._queue_seed(rest, msg_id)
+            return
+        if command == "guide":
+            self._queue_guidance(rest, msg_id)
             return
 
-        self._interpret(line)
+        self._interpret(line, msg_id)
 
-    def _queue_seed(self, raw: str) -> None:
+    def _request(self, action: str, text: str, msg_id=None) -> None:
+        if action == "abort":
+            self.bus.request_abort()
+        else:
+            self.bus.request_stop()
+        self.bus.push(action)
+        self._say(text, kind="action", reply_to=msg_id, style="red" if action == "abort" else "yellow")
+
+    def _queue_seed(self, raw: str, msg_id=None) -> None:
         if not raw:
-            self.console.print("[yellow]Usage: seed <path to a .py file>[/yellow]")
+            self._say("Usage: `seed <path to a .py file>`", kind="error", reply_to=msg_id, style="yellow")
             return
         path = Path(raw).expanduser()
         if not path.is_file():
-            self.console.print(f"[red]Not a file:[/red] {path}")
+            self._say(f"Not a file: {path}", kind="error", reply_to=msg_id, style="red")
             return
-        self.console.print(f"[green]Queued:[/green] next step will start from {path.name}")
         self.bus.push("seed", path=str(path.resolve()))
+        self._say(f"Queued: the next step will start from {path.name}.", kind="action", reply_to=msg_id, style="green")
 
-    def _interpret(self, message: str) -> None:
+    def _queue_guidance(self, text: str, msg_id=None, note: str = "") -> None:
+        text = text.strip()
+        if not text:
+            self._say("Usage: `guide <what the agents should try or avoid>`", kind="error",
+                      reply_to=msg_id, style="yellow")
+            return
+        text = text[:2000]
+        if self.on_guidance is not None:
+            self.on_guidance(text)
+        else:
+            self.bus.push("guide", text=text)
+        self._say((note + "\n\n" if note else "") +
+                  f"Guidance added for the steps that start from now on:\n\n> {text}",
+                  kind="action", reply_to=msg_id, style="green")
+
+    def status_text(self) -> str:
+        snap = self._snapshot()
+        rows = [("Progress", "progress"), ("Running", "running"), ("Best score", "best_metric"),
+                ("Best solution", "best_node"), ("Elapsed", "elapsed"), ("Solutions", "nodes"),
+                ("Branches", "branches")]
+        lines = [f"- **{label}:** {snap[key]}" for label, key in rows if snap.get(key) is not None]
+        if not lines:
+            # The loop publishes progress only once the search proper starts.
+            lines.append(f"- **Phase:** setting up and writing the first drafts "
+                         f"({snap.get('solutions_so_far', 0)} solutions so far)")
+        for item in snap.get("in_progress") or []:
+            if item.get("what") == "solution_script":
+                lines.append(f"- **Now:** running the script of solution {item['solution']} ({item['seconds']} s)")
+            else:
+                target = f"solution {item['solution']}" if item.get("solution") else "a new solution"
+                lines.append(f"- **Now:** {item.get('agent') or 'an agent'} ({item.get('step')}) for {target} "
+                             f"({item['seconds']} s)")
+        for g in snap.get("operator_guidance_in_effect") or []:
+            lines.append(f"- **Guidance in effect:** {g}")
+        return "\n".join(lines)
+
+    def _snapshot(self) -> dict:
+        snap = dict(self.bus.snapshot)
+        if self.context is not None:
+            try:
+                snap.update(self.context())
+            except Exception as e:
+                logger.warning(f"Main agent context failed: {e}")
+        return snap
+
+    def _interpret(self, message: str, msg_id=None) -> None:
         """Free text. Interpreted here so the search loop never waits on a model."""
         from llm import generate
         from utils.response import extract_review
 
-        snapshot = self.bus.snapshot
         self.console.print("[dim]thinking ...[/dim]")
+        with self._history_lock:
+            history = "\n".join(f"{who}: {text[:600]}" for who, text in self._history[:-1]) or "(none)"
         try:
             raw = generate(
                 prompt={
                     "system": INTERPRET_SYSTEM,
                     "user": INTERPRET_TEMPLATE.format(
-                        snapshot=json.dumps(snapshot, indent=2, default=str), message=message
+                        snapshot=json.dumps(self._snapshot(), indent=2, default=str),
+                        history=history, message=message,
                     ),
                 },
                 cfg=self.cfg,
@@ -226,27 +343,25 @@ class MainAgent:
             data = extract_review(raw)
         except Exception as e:
             logger.warning(f"Main agent interpretation failed: {e}")
-            self.console.print("[yellow]I did not follow that. Type 'help' for commands.[/yellow]")
+            self._say("I did not follow that. Type `help` for commands.", kind="error",
+                      reply_to=msg_id, style="yellow")
             return
 
         action = str(data.get("action", "reply")).lower() if isinstance(data, dict) else "reply"
         reply = str(data.get("reply", "")).strip() if isinstance(data, dict) else ""
 
         if action == "stop":
-            self.console.print(f"[yellow]{reply or 'Stopping after the running steps finish.'}[/yellow]")
-            self.bus.request_stop()
-            self.bus.push("stop")
+            self._request("stop", reply or "Stopping after the running steps finish.", msg_id)
         elif action == "abort":
-            self.console.print(f"[red]{reply or 'Aborting now.'}[/red]")
-            self.bus.request_abort()
-            self.bus.push("abort")
+            self._request("abort", reply or "Aborting now.", msg_id)
         elif action == "seed":
-            self._queue_seed(str(data.get("path", "")))
+            self._queue_seed(str(data.get("path", "")), msg_id)
+        elif action == "guide":
+            self._queue_guidance(str(data.get("guidance") or message), msg_id, note=reply)
         elif action == "status":
-            self.bus.push("status")
+            self._say((reply + "\n\n" if reply else "") + self.status_text(), reply_to=msg_id)
         else:
-            self.console.print(Panel(reply or "I am not sure what you mean.",
-                                     border_style="cyan", expand=False))
+            self._say(reply or "I am not sure what you mean. Type `help` for commands.", reply_to=msg_id)
 
 
 def _demo() -> None:

@@ -13,11 +13,15 @@ terminal: several hundred lines do not fit in a panel, and an editor is the
 right place to read them.
 """
 
+import io
+import os
+import json
 import logging
 import re
 import sys
 import threading
 import time
+from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
@@ -33,6 +37,14 @@ logger = logging.getLogger("MLEvolve")
 _gate = threading.Lock()
 
 ACCEPT, REJECT, ABORT = "accept", "reject", "abort"
+
+# draft_review.channel = file: the dashboard answers instead of the terminal.
+# One writer per file, because the run (WSL) and the dashboard (Windows) are
+# separate processes.
+REVIEW_FILE = "draft_review.jsonl"            # written only by the run
+ANSWERS_FILE = "draft_review_answers.jsonl"   # written only by the dashboard
+POLL_S = 1.0
+HEARTBEAT_S = 30.0   # touch the review file while waiting, so the dashboard sees the run is alive
 
 KNOWN_MODELS = [
     "LGBMClassifier", "XGBClassifier", "CatBoost", "HistGradientBoosting",
@@ -86,10 +98,14 @@ def _write_draft_file(cfg, node, index: int):
 
 
 def _answer_question(agent, node, question: str, console: Console) -> None:
+    console.print("[dim]thinking ...[/dim]")
+    console.print(Panel(_answer_text(agent, node, question), border_style="cyan", expand=False))
+
+
+def _answer_text(agent, node, question: str) -> str:
     from llm import generate
     from utils.response import trim_long_string
 
-    console.print("[dim]thinking ...[/dim]")
     try:
         reply = generate(
             prompt={
@@ -106,7 +122,7 @@ def _answer_question(agent, node, question: str, console: Console) -> None:
     except Exception as e:
         logger.warning(f"Could not answer the draft question: {e}")
         reply = "I could not answer that. /go runs it, /change regenerates, /skip drops it."
-    console.print(Panel(reply, border_style="cyan", expand=False))
+    return reply
 
 
 def _show(node, index: int, total: int, windows_path: str, console: Console) -> None:
@@ -158,6 +174,16 @@ def review_draft(agent, node, index: int, total: int, console: Console | None = 
     cfg = agent.cfg
     if not getattr(getattr(cfg, "draft_review", None), "enabled", False):
         return ACCEPT
+
+    if getattr(cfg.draft_review, "channel", "terminal") == "file":
+        with _gate:
+            started = time.time()
+            try:
+                return _review_via_files(agent, node, index, total)
+            finally:
+                waited = time.time() - started
+                agent.paused_seconds += waited
+                logger.info(f"Draft review took {waited:.0f}s, excluded from the search budget.")
 
     # No terminal to ask on. Unlike the plan gate, this fires mid-run, so
     # aborting would throw away work already paid for. Accept and say so.
@@ -224,3 +250,100 @@ def review_draft(agent, node, index: int, total: int, console: Console | None = 
             waited = time.time() - started
             agent.paused_seconds += waited
             logger.info(f"Draft review took {waited:.0f}s, excluded from the search budget.")
+
+
+# ── dashboard channel ────────────────────────────────────────────────────────
+
+def _append(path: Path, record: dict) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, default=str) + "\n")
+
+
+def _read_new(path: Path, offset: int) -> tuple[list[dict], int]:
+    """Complete JSON lines added to path after byte offset, and the new offset."""
+    if not path.exists():
+        return [], offset
+    with open(path, "rb") as f:
+        f.seek(offset)
+        chunk = f.read()
+    end = chunk.rfind(b"\n")
+    if end < 0:
+        return [], offset
+    out = []
+    for line in chunk[: end + 1].decode("utf-8", errors="replace").splitlines():
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out, offset + end + 1
+
+
+def _review_via_files(agent, node, index: int, total: int) -> str:
+    """Ask the dashboard: write the draft request, then wait for its answer.
+
+    Answers: accept, reject (optional reason), skip, abort, edited (reload the
+    file), ask (a question; the reply goes back through the review file). A stop
+    or abort from the dashboard ends the wait.
+    """
+    cfg = agent.cfg
+    logs = Path(cfg.log_dir)
+    logs.mkdir(parents=True, exist_ok=True)
+    out, inbox = logs / REVIEW_FILE, logs / ANSWERS_FILE
+    path, windows_path = _write_draft_file(cfg, node, index)
+    rid = f"{node.id[:8]}-{index}-{int(time.time() * 1000)}"
+    offset = inbox.stat().st_size if inbox.exists() else 0  # answers to earlier drafts do not count
+    _append(out, {"t": time.time(), "type": "draft", "id": rid, "index": index, "total": total,
+                  "node": node.id, "path": windows_path, "facts": summarise(node.code),
+                  "plan": (node.plan or "").strip()[:4000]})
+    logger.info(f"Draft {index} written for review in the dashboard: {path}")
+
+    def reply(text: str, reply_to=None) -> None:
+        _append(out, {"t": time.time(), "type": "reply", "id": rid, "reply_to": reply_to, "text": text})
+
+    verdict = None
+    bus = getattr(agent, "control", None)
+    beat = time.time()
+    while verdict is None:
+        if time.time() - beat >= HEARTBEAT_S:
+            beat = time.time()
+            try:
+                os.utime(out)
+            except OSError:
+                pass
+        if bus is not None and bus.stop_requested:
+            verdict = ABORT
+            break
+        answers, offset = _read_new(inbox, offset)
+        for a in answers:
+            if a.get("id") != rid or verdict is not None:
+                continue
+            kind, text = a.get("verdict"), str(a.get("text") or "").strip()
+            if kind == "accept":
+                verdict = ACCEPT
+            elif kind == "reject":
+                node.review_feedback = text or None
+                verdict = REJECT
+            elif kind == "skip":
+                verdict = REJECT
+            elif kind == "abort":
+                verdict = ABORT
+            elif kind == "edited":
+                reloaded = path.read_text(encoding="utf-8")
+                if reloaded.strip() == node.code.strip():
+                    reply("That file has not changed.", a.get("msg"))
+                    continue
+                node.code = reloaded
+                buf = io.StringIO()
+                _rereview(agent, node, Console(file=buf, width=100, color_system=None))
+                path.write_text(node.code, encoding="utf-8")
+                reply(f"Reloaded {len(reloaded.splitlines())} lines. " + " ".join(buf.getvalue().split()),
+                      a.get("msg"))
+            elif kind == "ask" and text:
+                reply(_answer_text(agent, node, text), a.get("msg"))
+        if verdict is None:
+            time.sleep(POLL_S)
+
+    if verdict == REJECT and getattr(node, "review_feedback", None):
+        logger.info(f"Draft {index} rejected with feedback: {node.review_feedback}")
+    _append(out, {"t": time.time(), "type": "result", "id": rid, "index": index, "verdict": verdict})
+    return verdict

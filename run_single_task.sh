@@ -75,7 +75,8 @@ CUDA_VISIBLE_DEVICES=$MEMORY_INDEX timeout --foreground --signal=TERM --kill-aft
   start_cpu_id="${start_cpu}" \
   cpu_number="${CPUS_PER_TASK}" \
   plan_mode.require_confirmation=False \
-  draft_review.enabled=False
+  draft_review.enabled=False \
+  eda.enabled=False
 
 RUN_EXIT=$?
 
