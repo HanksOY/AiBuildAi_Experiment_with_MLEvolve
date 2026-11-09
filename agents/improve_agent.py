@@ -18,18 +18,20 @@ from agents.prompts import (
 from agents.planner import run_planner, generate_initial_plan, refine_plan_to_json, build_planner_task, build_planner_suffix, build_chat_prompt_for_model
 from agents.coder import plan_and_code_query
 from agents.coder.diff_coder import diff_generate_and_apply
+from agents.prompts.framing import framing_of
 
 logger = logging.getLogger("MLEvolve")
 
 
 def run(agent, parent_node: SearchNode) -> SearchNode:
+    framing = framing_of(agent.cfg)
     improvement_standards = (
         "🎯 As a Grandmaster, make MEANINGFUL improvements that boost leaderboard performance.\n\n"
         "**Acceptable**: Advanced architectures, ensemble techniques, feature engineering, hyperparameter optimization, improved pipelines.\n"
         "**NOT Acceptable**: Cosmetic changes, minor tweaks without justification, breaking functionality.\n\n"
     )
 
-    introduction = (
+    introduction = framing.adapt(
         improvement_standards +
         "You are provided with a previously developed solution below and should improve it "
         "in order to further increase the (test time) performance. "
@@ -62,7 +64,7 @@ def run(agent, parent_node: SearchNode) -> SearchNode:
         else:
             best_score_str = f"{branch_best_score:.4f}"
         prompt["Instructions"] |= {
-            "🔥 Improvement Strategy: Magnitude-Based Reasoning": [
+            "🔥 Improvement Strategy: Magnitude-Based Reasoning": framing.adapt_lines([
                 "",
                 "⚠️ **CRITICAL: The current approach has hit a plateau.**",
                 "",
@@ -105,7 +107,7 @@ def run(agent, parent_node: SearchNode) -> SearchNode:
                 "- Which Tier you're using and why",
                 "- What specific components will change",
                 "- Why this addresses the root cause of the plateau",
-            ],
+            ]),
         }
     else:
         prompt["Instructions"] |= {
@@ -215,7 +217,7 @@ def run(agent, parent_node: SearchNode) -> SearchNode:
 
     prompt["Instructions"] |= get_impl_guideline_from_agent(agent)
     prompt["Instructions"] |= prompt_leakage_prevention()
-    internet_clarification = get_internet_clarification(getattr(agent.cfg, "pretrain_model_dir", ""))
+    internet_clarification = get_internet_clarification(getattr(agent.cfg, "pretrain_model_dir", ""), framing)
     prompt["Instructions"]["Implementation guideline"].extend(internet_clarification)
     prompt["Instructions"] |= ROBUSTNESS_GENERALIZATION_STRATEGY
 
@@ -333,5 +335,5 @@ def _diff_improve(agent, prompt_base, data_preview, parent_node):
         parent_code=parent_node.code,
         data_preview=data_preview,
         execution_output=context["execution_output"],
-        introduction=_IMPROVE_DIFF_INTRODUCTION,
+        introduction=framing_of(agent.cfg).adapt(_IMPROVE_DIFF_INTRODUCTION),
     )

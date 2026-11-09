@@ -23,6 +23,7 @@ from agents.planner.base_planner import (
     PLANNING_JSON_SCHEMA,
     parse_planning_response,
 )
+from agents.prompts.framing import UPSTREAM, Framing, framing_of
 
 logger = logging.getLogger("MLEvolve")
 
@@ -322,7 +323,7 @@ class MetaAgent:
         agent_instance,
         context: StepwiseContext,
         ) -> Tuple[str, str]:
-        introduction = (
+        introduction = framing_of(agent_instance.cfg).adapt(
             "You are a Kaggle grandmaster attending a competition, an expert in writing clean, efficient, and competition-winning Python code for ML tasks. "
             "You have received code snippets from a team of specialized agents, each focusing on a specific part of the ML pipeline. "
             "Your critical task is to intelligently merge these partial scripts into a single, cohesive, and fully runnable Python script."
@@ -345,7 +346,7 @@ class MetaAgent:
             "There should be no additional headings or text in your response."
         )
 
-        prompt_instructions["Merge guidelines"] = [
+        prompt_instructions["Merge guidelines"] = framing_of(agent_instance.cfg).adapt_lines([
             "- Combine all code sections into a single, runnable Python script",
             "- CRITICAL: You are a MERGER, not a designer. Faithfully integrate the code from all steps. Do NOT introduce new models, algorithms, or approaches that were not in the original steps.",
             "- Ensure variable names are consistent across steps",
@@ -356,7 +357,7 @@ class MetaAgent:
             "- The code should be a single-file Python program that can be executed as-is",
             "- Assume previous steps have NOT been executed; do not skip execution steps and only read files or outputs.",
             "- All parts must work together seamlessly",
-        ]
+        ])
 
         prompt: Dict[str, Any] = {
             "Introduction": introduction,
@@ -419,8 +420,8 @@ class MetaAgent:
         return "\n".join(code_parts)
 
 
-def create_default_step_agents() -> List[StepAgent]:
-    return [
+def create_default_step_agents(framing: Framing = UPSTREAM) -> List[StepAgent]:
+    step_agents = [
         StepAgent(
             name="data_processing_and_feature_engineering",
             introduction="You are a Data Preparation Specialist responsible for data loading, cleaning, and feature engineering.",
@@ -468,6 +469,17 @@ def create_default_step_agents() -> List[StepAgent]:
             ],
         ),
     ]
+    if framing.is_upstream:
+        return step_agents
+    return [
+        StepAgent(
+            name=a.name,
+            introduction=framing.adapt(a.introduction),
+            description=framing.adapt(a.description),
+            guidelines=framing.adapt_lines(a.guidelines),
+        )
+        for a in step_agents
+    ]
 
 
 def stepwise_plan_and_code_query(
@@ -485,7 +497,7 @@ def stepwise_plan_and_code_query(
         execution_output=context.get("execution_output", ""),
     )
 
-    step_agents = create_default_step_agents()
+    step_agents = create_default_step_agents(framing_of(agent_instance.cfg))
     meta_agent = MetaAgent()
 
     step_results: List[Dict[str, str]] = []

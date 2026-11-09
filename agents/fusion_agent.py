@@ -7,6 +7,7 @@ from llm import compile_prompt_to_md
 from engine.search_node import SearchNode
 from utils.response import wrap_code
 from agents.prompts import prompt_resp_fmt, get_impl_guideline_from_agent
+from agents.prompts.framing import framing_of
 from agents.improve_agent import run as run_improve
 from agents.planner import run_planner, build_planner_task, build_chat_prompt_for_model
 from agents.coder import plan_and_code_query
@@ -34,7 +35,7 @@ def _get_fusion_candidates(agent, parent_node: SearchNode) -> List[SearchNode]:
 
 
 def fuse_two_nodes(agent, source_node: SearchNode, target_node: SearchNode) -> SearchNode:
-    introduction = (
+    introduction = framing_of(agent.cfg).adapt(
         "You are a Kaggle grandmaster attending a competition. "
         "You are provided with a successful reference solution from another approach below. "
         "Your task is to analyze this reference solution and improve your current solution by drawing inspiration from its strengths. "
@@ -169,7 +170,7 @@ def fuse_two_nodes(agent, source_node: SearchNode, target_node: SearchNode) -> S
 def _fuse_with_multiple_references(
     agent, parent_node: SearchNode, reference_nodes: List[SearchNode]
 ) -> SearchNode:
-    introduction = (
+    introduction = framing_of(agent.cfg).adapt(
         "You are a Kaggle grandmaster attending a competition. "
         "You are provided with multiple successful solutions from different approaches below. "
         "Your task is to analyze these reference solutions and improve your current solution by drawing inspiration from their strengths. "
@@ -445,7 +446,7 @@ def _diff_fusion(agent, prompt_base, data_preview, source_node):
         parent_code=source_node.code,
         data_preview=data_preview,
         execution_output="",
-        introduction=_FUSION_DIFF_INTRODUCTION,
+        introduction=framing_of(agent.cfg).adapt(_FUSION_DIFF_INTRODUCTION),
         extra_context=extra_context,
     )
 
@@ -495,6 +496,6 @@ def _diff_multi_fusion(agent, prompt_base, data_preview, parent_node):
         parent_code=parent_node.code,
         data_preview=data_preview,
         execution_output="",
-        introduction=_MULTI_FUSION_DIFF_INTRODUCTION,
+        introduction=framing_of(agent.cfg).adapt(_MULTI_FUSION_DIFF_INTRODUCTION),
         extra_context=extra_context,
     )

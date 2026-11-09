@@ -4,10 +4,12 @@ import time
 
 import humanize
 
+from agents.prompts.framing import UPSTREAM, Framing, framing_of
+
 
 def get_impl_guideline_from_agent(agent):
     """Build implementation guideline from agent config."""
-    tot_time_remaining = agent.acfg.time_limit - (time.time() - agent.start_time)
+    tot_time_remaining = agent.acfg.time_limit - agent.elapsed()
     exec_timeout = int(min(agent.cfg.exec.timeout, tot_time_remaining))
     return get_impl_guideline(
         tot_time_remaining=tot_time_remaining,
@@ -16,6 +18,7 @@ def get_impl_guideline_from_agent(agent):
         expose_prediction=getattr(agent.acfg, "expose_prediction", False),
         k_fold_validation=getattr(agent.acfg, "k_fold_validation", 0),
         pretrain_model_dir=getattr(agent.cfg, "pretrain_model_dir", ""),
+        framing=framing_of(agent.cfg),
     )
 
 
@@ -31,6 +34,7 @@ def get_impl_guideline(
     expose_prediction: bool = False,
     k_fold_validation: int = 0,
     pretrain_model_dir: str = "",
+    framing: Framing = UPSTREAM,
 ) -> dict:
     """Build implementation guideline from time and config."""
     impl_guideline = [
@@ -83,6 +87,14 @@ def get_impl_guideline(
         "• ❌ FORBIDDEN: Using a proxy metric as the main validation score for model comparison, search ranking, or best-solution selection.",
         "• Do not report a validation score from a metric that ignores critical task dimensions required by the leaderboard.",
         "",
+        "**7. Keep the Code Short and Readable**",
+        "• A human reads this before it runs. Write for that reader: concise and plain beats clever.",
+        "• Factor repeated logic into small, named functions. Do NOT copy a block per fold, per threshold, or per model.",
+        "• Prefer one loop over a list of models to several near-identical blocks.",
+        "• Keep each function short and single-purpose. ❌ Avoid long, deeply nested, heavily branched definitions.",
+        "• ❌ No speculative structure: no classes, decorators or config layers where a plain function will do.",
+        "• This is about how the code is ORGANISED, not about doing less work — every required output above must still be produced.",
+        "",
         "📁 **Directories**: Input data in `./input/`, submission in `./submission/`, temp files in `./working/`",
         "",
         f"📦 **Packages & Internet**: numpy, pandas, sklearn, torch, transformers, timm, xgboost, lightgbm (all pre-installed). torch.hub.load(), HuggingFace, etc. available during development."
@@ -111,6 +123,7 @@ def get_impl_guideline(
         "□ Did my local validation preserve the original task semantics instead of a simpler proxy?",
         "□ Is my reported `Final Validation Score` computed with the official metric definition rather than a proxy metric?",
         "□ Is every scaler/imputer/encoder/selector/resampler fitted INSIDE the fold loop, not once before it?",
+        "□ Could a reviewer read this top to bottom in a few minutes? If not, factor the repetition out.",
     ]
     if expose_prediction:
         impl_guideline.append(
@@ -124,4 +137,4 @@ def get_impl_guideline(
             f"The evaluation should be based on {k_fold_validation}-fold cross-validation but only if that's an appropriate evaluation for the task at hand."
         )
 
-    return {"Implementation guideline": impl_guideline}
+    return {"Implementation guideline": framing.adapt_lines(impl_guideline)}

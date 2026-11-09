@@ -8,6 +8,7 @@ from typing import Callable, List, Dict, Optional
 from engine.executor import ExecutionResult
 from engine.search_node import SearchNode, Journal
 import utils.data_preview as data_preview
+from agents.prompts.framing import framing_of
 from config import Config
 from utils.metric import WorstMetricValue
 import threading
@@ -57,6 +58,9 @@ class AgentSearch:
         self.journal_lock = threading.Lock()
         self.save_node_lock = threading.Lock()
         self.start_time = time.time()
+        # Seconds spent blocked on the user. Subtracted from every elapsed
+        # calculation so reading a draft does not consume the search budget.
+        self.paused_seconds = 0.0
         self.use_stepwise_generation = getattr(self.acfg, "use_stepwise_generation", True)
 
         self.next_branch_id = 1
@@ -107,6 +111,13 @@ class AgentSearch:
         else:
             logger.info("[AgentSearch] Global memory is disabled by config")
 
+    def elapsed(self, since: float | None = None) -> float:
+        """Seconds of actual search time, excluding time spent waiting on the user."""
+        origin = since if since is not None else self.start_time
+        if origin is None:
+            return 0.0
+        return max(0.0, time.time() - origin - self.paused_seconds)
+
     def _serialize_prompt(self, prompt_complete) -> str | None:
         """Serialize prompt (str or dict) to string for saving in node."""
         if prompt_complete is None:
@@ -119,7 +130,7 @@ class AgentSearch:
             return str(prompt_complete)
 
     def update_data_preview(self):
-        base_preview = data_preview.generate(self.cfg.workspace_dir)
+        base_preview = data_preview.generate(self.cfg.workspace_dir, framing=framing_of(self.cfg))
         submission_format_warning = """
 
         ⚠️  CRITICAL SUBMISSION FORMAT NOTE:
@@ -172,7 +183,7 @@ class AgentSearch:
                 elif parent_node.is_buggy is False:
                     can_use_fusion = False
                     if self.search_start_time:
-                        elapsed_time = time.time() - self.search_start_time
+                        elapsed_time = self.elapsed(self.search_start_time)
                         if elapsed_time >= self.acfg.time_limit / 2:
                             can_use_fusion = True
                     is_from_topk = getattr(parent_node, '_topk_triggered', False)

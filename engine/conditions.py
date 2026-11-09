@@ -15,7 +15,7 @@ def should_trigger_branch_fusion(agent) -> bool:
         return False
 
     scfg = agent.scfg
-    elapsed_time = time.time() - agent.search_start_time
+    elapsed_time = agent.elapsed(agent.search_start_time)
     if elapsed_time < scfg.fusion_min_time_hours * 3600 or elapsed_time > scfg.fusion_max_time_hours * 3600:
         return False
 

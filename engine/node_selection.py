@@ -41,17 +41,18 @@ def select(agent, node: SearchNode):
     """UCT selection: recurse from node, return node to expand (root lock for drafts)."""
     def _best_child(n: SearchNode) -> SearchNode:
         C = _compute_exploration_constant(agent)
+        a = getattr(agent.scfg, "max_backup_weight", 0.0)
         if agent.is_root(n):
             filtered_children = [child for child in n.children if not child.lock]
             selected_node = n
             if len(filtered_children) > 0:
                 selected_node = max(filtered_children,
-                                    key=lambda child: child.uct_value(exploration_constant=C))
+                                    key=lambda child: child.uct_value(exploration_constant=C, max_backup_weight=a))
             if selected_node.stage in ["draft", "fusion_draft"]:
                 selected_node.lock = True
             return selected_node
         else:
-            return max(n.children, key=lambda child: child.uct_value(exploration_constant=C))
+            return max(n.children, key=lambda child: child.uct_value(exploration_constant=C, max_backup_weight=a))
 
     while node and not node.is_terminal:
         if not node.reached_child_limit(scfg=agent.scfg):
@@ -169,7 +170,7 @@ def select_with_soft_switch(agent) -> SearchNode:
         logger.info("📊 Search not started yet, using standard UCT")
         return select(agent, agent.virtual_root)
 
-    time_elapsed = time.time() - agent.search_start_time
+    time_elapsed = agent.elapsed(agent.search_start_time)
     total_time = agent.acfg.time_limit
     time_progress = time_elapsed / total_time
 

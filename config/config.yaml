@@ -2,107 +2,36 @@
 #  Data & paths
 # ============================================================
 data_dir: "/mnt/e/Internship/UCSD/Test v2.0.1/Test v2.0.1/public"
-dataset_dir: "/mnt/e/Internship/UCSD/Test v2.0.1/Test v2.0.1/public"  # mle-bench dataset root; unused for custom tasks, but must be a valid path
+dataset_dir: "/mnt/e/Internship/UCSD/Test v2.0.1/Test v2.0.1/public"
 desc_file: null
 goal: |
-  Build and train a binary classifier that predicts meningitis from encoded
-  electronic health-record data (per-patient ICD-9 diagnosis code counts).
-  CPU-only: use classical machine learning (logistic regression, random forest,
-  extra-trees, HistGradientBoosting, XGBoost/LightGBM in CPU mode, linear SVM).
-  Do NOT use deep learning or any model that requires a GPU.
+  Build a CPU-only binary classifier that predicts whether a patient has meningitis from encoded EHR features. Allowed models are classical ML only: logistic regression, random forest, extra-trees, HistGradientBoosting, XGBoost or LightGBM in CPU mode, and SVM. Do not use deep learning or any GPU-dependent model.
 
-  ## Data files
+  **There is no target column. Create one.** Each file is one class:
+  - `full_encoded_meningitis.csv` (214 rows, 983 columns) → `target = 1`
+  - `full_encoded_non_meningitis.xls` → `target = 0`
 
-  Two files live in ./input/, one per class:
-    - "full_encoded_meningitis.csv"      -> positive cases, CLASSIFIER = 1
-    - "full_encoded_non_meningitis.xls"  -> negative cases, CLASSIFIER = 0
+  Concatenate the two files after aligning their columns.
 
-  CRITICAL: despite the ".xls" extension, "full_encoded_non_meningitis.xls" is a
-  plain comma-separated CSV text file, NOT an Excel workbook. Read BOTH files with
-  pandas.read_csv. Calling pandas.read_excel on it raises
-  "ValueError: Excel file format cannot be determined" and fails the whole run.
-
-  Shapes: positive = 214 rows x 983 columns; negative = 46303 rows x 6962 columns.
-
-  ## Schema
-
-  "SUBJECT_ID" is a patient identifier and MUST be dropped from the features.
-  "GENDER" is a binary feature and MUST be kept.
-  "CLASSIFIER" is the target (1 = meningitis, 0 = not meningitis).
-  Every other column is an ICD-9 diagnosis code holding an integer count per
-  patient, forming a wide sparse matrix.
-
-  ## MANDATORY feature selection - prevents label leakage
-
-  The two files DO NOT share the same columns: 960 are common, 23 exist only in
-  the positive file, and 6002 exist only in the negative file. Concatenating them
-  and filling missing values with 0 encodes the label directly into the schema
-  (the positive-only columns include ICD-9 320-322, which ARE the meningitis
-  diagnosis codes) and yields a meaningless near-perfect score.
-
-  Build the feature matrix exactly like this:
-    1. Read only the header row of each file and take the INTERSECTION of the two
-       column sets, which is 960 columns. NEVER use the union.
-    2. From that intersection remove these 8 CNS-infection / meningitis codes,
-       which are direct proxies for the label:
-         "0362", "0479", "0530", "05472", "3239", "3240", "3241", "325"
-    3. Drop "SUBJECT_ID" from the features and hold out "CLASSIFIER" as the target.
-  This leaves exactly 950 features: 949 ICD-9 code columns plus GENDER. Assert that
-  count in code so any mistake fails loudly instead of silently inflating scores.
-
-  ## Memory
-
-  Pass the selected column list to pandas.read_csv via usecols, and read the ICD-9
-  count columns as numpy.int16. Loading all 6962 negative columns at the default
-  int64 needs roughly 2.6 GB and can exhaust memory.
-
-  ## Class imbalance
-
-  214 positives against 46303 negatives, i.e. 0.46% positive. Handle this
-  explicitly via class_weight="balanced", scale_pos_weight, stratified splits
-  and/or resampling. Use a fixed random seed of 42 everywhere for reproducibility.
+  **Data traps:**
+  - **Misleading extension:** the 645 MB `.xls` is almost certainly delimited text, not a real Excel file. Inspect the first bytes before choosing a reader. Do not call an Excel reader blindly.
+  - **Size:** the negative file is large (likely hundreds of thousands of rows). Read it in chunks. Cast the 0/1 code columns to `uint8` or sparse, and avoid float64 copies.
+  - **Schema mismatch:** the files may differ in which columns they have or their order. Align them on column names. Fill codes missing from one file with 0, and log the differences.
+  - **Extreme imbalance:** there are about 214 positives against a very large negative set. Use class weights or negative subsampling for training only. Never subsample the validation data.
+  - **Label leakage:** the columns are ICD-9 diagnosis codes, and several of them define meningitis itself. Drop every code that encodes a meningitis diagnosis. This includes at least 320\*, 321\*, 322\*, 0360, 0130, 047\*, 0490, 0530, 05472, 0721, 09181, 0942, 09882, 10081, 11283, 1142, and 115x1. Also review 036\* (meningococcal codes such as `0362`). Log every dropped column.
+  - **Drop** `SUBJECT_ID` as a feature, but keep it as the row ID. Check for duplicate IDs within and across files. Encode `GENDER` as binary.
+  - Ignore `MLEvolve prompt.doc`. It is not data.
 eval: |
-  Primary optimization metric: PRAUC (average precision on the positive/meningitis
-  class). Maximize it.
+  **Metric:** Average Precision (PR-AUC) on the positive class. Higher is better. Also report ROC-AUC, but only for information.
 
-  ## Protocol
+  **Validation:** stratified 5-fold cross-validation over all rows, with a fixed seed (42). Group the folds by `SUBJECT_ID` if any ID repeats. Fit all preprocessing and resampling inside each fold. The score is the Average Precision of the pooled out-of-fold predictions.
 
-  There is no separate hold-out file. First carve out a stratified 20% hold-out
-  test split, then run stratified 5-fold cross-validation on the remaining 80%.
-  Keep the split seed fixed at 42.
+  **Required outputs:**
+  - `./submission/submission.csv` with columns `SUBJECT_ID, target, prediction`. It must contain one row per patient, where `prediction` is the out-of-fold probability of meningitis.
+  - A printed list of the dropped leakage columns, the ROC-AUC, and the class counts.
 
-  Rank solutions by the mean out-of-fold cross-validated PRAUC on the 80%, NOT by
-  the hold-out test score. The hold-out split must be touched only once, at the
-  end, to report an unbiased final estimate. Using it to guide model selection
-  across search steps would overfit it.
-
-  Report ALL of the following for the positive class, as cross-validated mean and
-  standard deviation AND on the hold-out test split:
-    - AUC (ROC-AUC)
-    - PRAUC (average precision)
-    - Recall / Sensitivity
-    - Specificity
-    - PPV (Precision)
-    - NPV (Negative Predictive Value)
-    - F1 score
-  For the threshold-dependent metrics (recall, specificity, PPV, NPV, F1) report
-  both at the default 0.5 threshold AND at an optimal threshold selected on the
-  training folds only (max F1 or Youden's J); state which threshold was used and
-  how it was chosen. Choosing the threshold on the hold-out split is leakage.
-
-  ## Required outputs
-
-  1. REQUIRED "./submission/submission.csv" with exactly two columns, "SUBJECT_ID"
-     and "CLASSIFIER", where CLASSIFIER is the predicted probability of the
-     positive class for every row of the 20% hold-out test split. The run is
-     marked FAILED if this file is missing, so write it as soon as predictions
-     exist, before producing any plots or reports that could raise.
-  2. REQUIRED print the mean out-of-fold cross-validated PRAUC as the final line,
-     exactly: print(f"Final Validation Score: {cv_prauc_mean}")
-  3. "./working/metrics.csv" plus an equivalent markdown summary table covering
-     every metric listed above.
-  4. PNG plots in "./working/": ROC curve with AUC, precision-recall curve with
-     PRAUC, confusion matrix, and top feature importances or coefficients.
+  The final line printed must be exactly:
+  `print(f"Final Validation Score: {score}")`
 exp_name: "first_test"
 exp_id: "exp01"
 
@@ -114,7 +43,7 @@ copy_data: False
 
 # Resource
 start_cpu_id: 0
-cpu_number: 11   # this machine reports 12 cores; leave one free
+cpu_number: 11
 
 # Model paths
 torch_hub_dir: ""       # path to torch hub cache, e.g. /data/pretrain_models/torch_models
@@ -143,18 +72,18 @@ agent:
   # API keys are read from the environment (see .env.example); never hard-code
   # them here, this file is git-tracked.
   code:
-    model: glm-5.2
+    model: claude-code:claude-opus-5-5
     temp: 1
-    base_url: "https://open.bigmodel.cn/api/paas/v4"   # GLM API endpoint
+    base_url: ""
     api_key: ${oc.env:MLEVOLVE_CODE_API_KEY,""}
     # Reasoning models spend part of this budget thinking. Too low and the code
     # block is cut mid-token, the ``` fence never closes, and extraction fails
     # (then retries 3x at full cost). Raise if you see truncation warnings.
     max_tokens: 65536
   feedback:
-    model: glm-4.5-air
+    model: claude-code:claude-sonnet-5
     temp: 1
-    base_url: "https://open.bigmodel.cn/api/paas/v4"   # GLM  API endpoint
+    base_url: ""
     api_key: ${oc.env:MLEVOLVE_FEEDBACK_API_KEY,""}
     max_tokens: 16384
 
@@ -202,6 +131,16 @@ agent:
 
     # Improvement criteria
     metric_improvement_threshold: 0.0001
+    # Sampling noise of the ranking metric. A gain smaller than this is a tie,
+    # not an improvement, so the search stops chasing favourable splits.
+    # Set it from your own CV spread: run a solution twice and take the std.
+    # Measured here: PRAUC std ~0.026 across 5 folds at 0.46% prevalence.
+    metric_noise_floor: 0.026
+    # UCT value = (1-w)*mean + w*best-in-subtree. Mean backup suits games,
+    # where you face an average of opponent replies. Here only the single
+    # best solution is submitted, so a branch with one strong result and
+    # some failures beats a uniformly mediocre one. 0.0 = original behaviour.
+    max_backup_weight: 0.7
     max_improve_failure: 3
 
     # Stagnation detection
@@ -247,6 +186,22 @@ agent:
     phase_ratios: [0.3, 0.7]
 
 # ============================================================
+#  Task framing
+# ============================================================
+task:
+  # How prompts describe the job (agents/prompts/framing.py).
+  #   kaggle  - upstream wording: Kaggle grandmaster, leaderboard, MLE-Bench
+  #             environment. Use for MLE-Bench comparisons.
+  #   generic - neutral wording for any train-a-model, report-a-validation-score
+  #             task. Also skips the MLE-Bench submission format server.
+  profile: kaggle
+  # true  - every solution must write ./submission/submission.csv (upstream).
+  # false - the printed validation score is the result; a prediction file is
+  #         written only if the task description asks for one. Use for tasks
+  #         that have no test set to predict.
+  require_submission: true
+
+# ============================================================
 #  Plan mode
 # ============================================================
 plan_mode:
@@ -257,6 +212,36 @@ plan_mode:
   # pass plan_mode.require_confirmation=False — run_single_task.sh already does.
   require_confirmation: true
   show_task_diff: true
+  # The dashboard runs the EDA and plan steps itself, before launch, and passes
+  # the approved task description (already cleaned) in desc_file. True skips
+  # cleaning it again, which could rewrite the approved plan.
+  preapproved: false
+
+# ============================================================
+#  Exploratory data analysis
+# ============================================================
+eda:
+  # Before planning, write and run an analysis script against the real data,
+  # confirm the report, then derive a data plan covering loading, cleaning,
+  # leakage control, feature engineering and splitting. The approved plan is
+  # appended to the task description every agent receives.
+  # Saved as EDA_report.md in the run directory. Needs a terminal.
+  enabled: true
+  timeout: 900        # seconds for the analysis script itself
+  max_attempts: 2     # regenerate the script this many times if it fails
+
+# ============================================================
+#  Draft review
+# ============================================================
+draft_review:
+  # Pause after each initial draft is written, before it runs, so you can
+  # read the code and accept, edit or reject it. Initial drafts only.
+  # Needs a terminal; unattended runs must pass draft_review.enabled=False.
+  enabled: true
+  max_regenerations: 2
+  # terminal: ask on stdin. file: the dashboard answers through
+  # logs/draft_review_answers.jsonl; the run writes logs/draft_review.jsonl.
+  channel: terminal
 
 # ============================================================
 #  Cold-start knowledge
@@ -266,3 +251,12 @@ coldstart:
   task_json_path: "engine/coldstart/competition_tag_classified.json"
   model_json_path: "engine/coldstart/models_guidance_classified.json"
   description: ""
+
+# ============================================================
+#  Dashboard recording (view with: python -m dashboard.server)
+# ============================================================
+monitor:
+  enabled: true            # write logs/monitor_events.jsonl for the dashboard
+  record_llm_calls: true   # one record per LLM call: agent, solution, tokens, seconds
+  snapshot_outputs: true   # copy each solution's tables/figures to workspace/node_outputs/<id>/
+  control: true            # accept Stop/Abort from the dashboard

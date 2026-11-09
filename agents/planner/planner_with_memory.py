@@ -16,6 +16,7 @@ from typing import Dict, Any
 from llm import generate, compile_prompt_to_md
 from llm.model_profiles import thinking_json_incompatible
 from utils.response import wrap_code
+from agents.prompts.framing import framing_of
 from .base_planner import (
     PLANNING_ALLOWED_MODULES,
     PLANNING_JSON_FORMAT,
@@ -63,7 +64,7 @@ def generate_initial_plan(
     if "Available Components" in initial_prompt_dict:
         instructions += f"\n\n# Available Components\n\n{initial_prompt_dict['Available Components']}\n"
 
-    introduction = (
+    introduction = framing_of(agent_instance.cfg).adapt(
         "You are a Kaggle grandmaster attending a competition. "
         "Based on the current solution, generate an improvement plan."
     )

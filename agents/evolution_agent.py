@@ -19,6 +19,7 @@ from agents.planner import run_planner, build_planner_task, build_planner_suffix
 from agents.coder import plan_and_code_query
 from agents.coder.diff_coder import diff_generate_and_apply
 from agents.triggers import register_node
+from agents.prompts.framing import framing_of
 
 logger = logging.getLogger("MLEvolve")
 
@@ -47,7 +48,7 @@ def run(agent, parent_node: SearchNode) -> SearchNode:
         logger.info(f"Insufficient trajectory history for evolution, falling back to normal improve for node {parent_node.id}")
         return run_improve(agent, parent_node)
 
-    introduction = (
+    introduction = framing_of(agent.cfg).adapt(
         "You are a Kaggle grandmaster attending a competition. You are provided with a previously developed "
         "solution below and should improve it in order to further increase the (test time) performance. "
         "For this you should first outline a brief plan in natural language for how the solution can be improved and "
@@ -302,7 +303,7 @@ def _diff_evolution(agent, prompt_base, data_preview, parent_node):
         parent_code=parent_node.code,
         data_preview=data_preview,
         execution_output=context["execution_output"],
-        introduction=_EVOLUTION_DIFF_INTRODUCTION,
+        introduction=framing_of(agent.cfg).adapt(_EVOLUTION_DIFF_INTRODUCTION),
         extra_context=extra_context,
         learning_guidance="Learn from evolution trajectory - use the evolution history to guide your changes. Build on successful patterns and avoid repeating failed approaches from the trajectory.",
     )

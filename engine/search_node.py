@@ -55,6 +55,10 @@ class SearchNode(DataClassJsonMixin):
     stage: Literal["root", "improve", "debug", "draft", "fusion_draft", "evolution", "fusion"]
     visits: int = field(default=0, kw_only=True)
     total_reward: float = field(default=0.0, kw_only=True)
+    # Best reward seen anywhere in this subtree. Only one solution is ever
+    # submitted, so the value of a branch is the best thing it found, not the
+    # average of everything it tried. See uct_value.
+    best_reward: float = field(default=float("-inf"), kw_only=True)
     is_terminal: bool = field(default=False, kw_only=True)
     _uct: float = field(default=0.0, kw_only=True)
     local_best_node: Optional["SearchNode"] = field(default=None, kw_only=True)
@@ -133,21 +137,32 @@ class SearchNode(DataClassJsonMixin):
         return self.alpha / (self.alpha + self.beta)
     
     
-    def uct_value(self, exploration_constant: float = 1.414) -> float:
+    def uct_value(self, exploration_constant: float = 1.414, max_backup_weight: float = 0.0) -> float:
         """
         Calculate the UCT (Upper Confidence Bound for Trees) value of the current node.
         UCT = Q + c * sqrt(ln(N) / n), where:
-        - Q = total_reward / visits (average reward)
+        - Q = (1-a) * mean_reward + a * best_reward, a = max_backup_weight
         - c = exploration_constant (exploration constant, default is sqrt(2))
         - N = parent_visits (number of visits to the parent node)
         - n = visits (number of visits to the current node)
+
+        Mean backup assumes the value of a subtree is what you expect to get from
+        it on average, which is right for games. Here only the single best
+        solution is ever submitted, so a branch holding one strong result and
+        several failures is worth more than a branch of uniformly mediocre ones —
+        and mean backup ranks it lower. max_backup_weight blends the two;
+        a = 0 reproduces the original behaviour exactly.
         """
         parent_visits: int | None = None
         if self.parent:
             parent_visits = self.parent.visits
         if self.visits == 0:
             return float('inf')  # Unvisited nodes have the highest priority
-        exploitation = self.total_reward / self.visits
+        mean_reward = self.total_reward / self.visits
+        if max_backup_weight > 0 and self.best_reward > float("-inf"):
+            exploitation = (1 - max_backup_weight) * mean_reward + max_backup_weight * self.best_reward
+        else:
+            exploitation = mean_reward
         exploration = exploration_constant * (math.log(parent_visits) / self.visits) ** 0.5
         self._uct = exploitation + exploration
         return self._uct
@@ -185,6 +200,10 @@ class SearchNode(DataClassJsonMixin):
         if add:
             self.visits += 1
             self.total_reward += result
+            # Tracked even when `add` is false would be wrong: an un-counted
+            # visit should not move the subtree's best either.
+            if result > self.best_reward:
+                self.best_reward = result
         
     def has_no_bug_child(self):
         for child in self.children:

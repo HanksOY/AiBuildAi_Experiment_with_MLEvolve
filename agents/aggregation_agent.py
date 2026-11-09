@@ -4,6 +4,7 @@ from typing import Any, List, Optional
 from llm import compile_prompt_to_md
 from engine.search_node import SearchNode
 from agents.prompts import prompt_resp_fmt, get_impl_guideline_from_agent
+from agents.prompts.framing import framing_of
 from agents.planner import build_chat_prompt_for_model
 from agents.coder import plan_and_code_query
 
@@ -73,7 +74,7 @@ def run(
         logger.info("Not enough successful branches for aggregation")
         return None
 
-    introduction = (
+    introduction = framing_of(agent.cfg).adapt(
         "You are a Kaggle grandmaster attending a competition. "
         "You are provided with multiple successful solutions from different independent branches below. "
         "Your task is to synthesize these diverse approaches and create a completely NEW solution "

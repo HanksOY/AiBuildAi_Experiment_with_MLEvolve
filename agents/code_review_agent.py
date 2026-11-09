@@ -8,6 +8,7 @@ from llm import FunctionSpec, query
 from engine.search_node import SearchNode
 from agents.prompts.validation_template_prompts import get_code_review_prompt
 from agents.prompts import get_internet_clarification
+from agents.prompts.framing import framing_of
 
 from agents.coder.diff_coder import SearchReplacePatcher
 
@@ -63,11 +64,13 @@ CODE_REVIEW_SPEC = FunctionSpec(
 def run(agent, node: SearchNode) -> str:
     logger.debug(f"[review] node {node.id}")
 
+    framing = framing_of(agent.cfg)
     prompt = get_code_review_prompt(
         task_desc=agent.task_desc,
         code=node.code,
+        framing=framing,
     )
-    internet_clarification = get_internet_clarification(getattr(agent.cfg, "pretrain_model_dir", ""))
+    internet_clarification = get_internet_clarification(getattr(agent.cfg, "pretrain_model_dir", ""), framing)
     if "Instructions" not in prompt:
         prompt["Instructions"] = {}
     if "Implementation guideline" in prompt["Instructions"]:

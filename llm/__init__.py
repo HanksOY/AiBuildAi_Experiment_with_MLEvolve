@@ -1,13 +1,17 @@
 import logging
 from . import gemini as _gemini
 from . import openai as _openai
+from . import claude_code as _claude_code
 from .gemini import FunctionSpec, OutputType, PromptType, compile_prompt_to_md
 from config import Config
+from utils import monitor
 logger = logging.getLogger("MLEvolve")
 
 
 def _provider(model: str) -> str:
-    """Use Gemini backend for model names starting with 'gemini', else OpenAI-compatible (e.g. Qwen)."""
+    """gemini* -> Gemini; claude-code[:model] -> local Claude Code CLI; else OpenAI-compatible (e.g. Qwen)."""
+    if _claude_code.is_claude_code(model):
+        return "claude_code"
     return "gemini" if (model or "").lower().startswith("gemini") else "openai"
 
 
@@ -60,7 +64,30 @@ def query(
         logger.info(f"function spec: {func_spec.to_dict()}", extra={"verbose": True})
 
     provider = _provider(model)
-    if provider == "openai":
+    call = monitor.llm_start(model, "query")
+    try:
+        output, in_tok_count, out_tok_count, info = _query_backend(
+            provider, system_message, user_message, func_spec, cfg, model_kwargs
+        )
+    except Exception as e:
+        monitor.llm_end(call, ok=False, error=str(e))
+        raise
+    monitor.llm_end(call, in_tok_count, out_tok_count, cost_usd=(info or {}).get("cost_usd_equivalent"))
+    logger.info("---Query complete---", extra={"verbose": True})
+
+    return output
+
+
+def _query_backend(provider, system_message, user_message, func_spec, cfg, model_kwargs):
+    if provider == "claude_code":
+        output, req_time, in_tok_count, out_tok_count, info = _claude_code.query(
+            system_message=system_message,
+            user_message=user_message,
+            func_spec=func_spec,
+            cfg=cfg,
+            **model_kwargs,
+        )
+    elif provider == "openai":
         output, req_time, in_tok_count, out_tok_count, info = _openai.query(
             system_message=system_message,
             user_message=user_message,
@@ -76,9 +103,7 @@ def query(
             cfg=cfg,
             **model_kwargs,
         )
-    logger.info("---Query complete---", extra={"verbose": True})
-
-    return output
+    return output, in_tok_count, out_tok_count, info
 
 
 def stage_config(cfg: Config, stage: str = "code"):
@@ -105,6 +130,36 @@ def generate(
     not silently billed to the code model's credentials.
     """
     model = getattr(stage_config(cfg, stage), "model", "") or ""
+    call = monitor.llm_start(model, "generate")
+    try:
+        output = _generate_backend(model, prompt, cfg, temperature, max_tokens, stop_tokens,
+                                   json_schema, max_retries, retry_delay, stage)
+    except Exception as e:
+        monitor.llm_end(call, ok=False, error=str(e))
+        raise
+    usage = _claude_code.last_usage() if _provider(model) == "claude_code" else None
+    if usage:
+        monitor.llm_end(call, usage["in_tokens"], usage["out_tokens"], cost_usd=usage.get("cost_usd"))
+    else:
+        # The streaming OpenAI/Gemini paths report no usage; estimate from text length.
+        monitor.llm_end(call, monitor.estimate_tokens(prompt), monitor.estimate_tokens(output), estimated=True)
+    return output
+
+
+def _generate_backend(model, prompt, cfg, temperature, max_tokens, stop_tokens,
+                      json_schema, max_retries, retry_delay, stage):
+    if _provider(model) == "claude_code":
+        return _claude_code.generate(
+            prompt=prompt,
+            cfg=cfg,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stop_tokens=stop_tokens,
+            json_schema=json_schema,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            stage=stage,
+        )
     if _provider(model) == "openai":
         return _openai.generate(
             prompt=prompt,
